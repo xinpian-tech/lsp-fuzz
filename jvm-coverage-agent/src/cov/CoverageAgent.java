@@ -7,23 +7,30 @@ import java.security.ProtectionDomain;
 import org.objectweb.asm.ClassReader;
 import org.objectweb.asm.ClassVisitor;
 import org.objectweb.asm.ClassWriter;
+import org.objectweb.asm.Label;
 import org.objectweb.asm.MethodVisitor;
 import org.objectweb.asm.Opcodes;
 
 /**
- * Minimal AFL-style bytecode-coverage agent (plan task4/task5). At class load it inserts a
- * deterministic {@code Cov.hit(id)} call at each method entry; ids are derived deterministically
- * from class+method+descriptor so identical runs produce byte-identical maps (AC-2 stability,
- * AC-5 cold replay).
+ * AFL-style bytecode-coverage agent. At class load it inserts a deterministic {@code Cov.hit(id)}
+ * at each basic-block leader and a {@code Cov.cls(id)} at each method entry; ids are derived
+ * deterministically from class + method + descriptor + block ordinal so identical runs produce
+ * byte-identical maps and cold replay reproduces.
  *
- * <p>First slice: instruments only the trivial fixture package ({@code fixture/}). The real
- * include/exclude scope (ls / dotty.tools / scala.meta / lsp4j / bsp4j) is applied in task6.
+ * <p>Only application-relevant packages are instrumented (the language server, the Scala 3
+ * presentation compiler, scalameta) plus the local fixture; JDK internals, the Scala runtime, and
+ * build tooling are skipped to avoid map saturation.
  */
 public final class CoverageAgent {
 
-    private static final String INCLUDE_PREFIX = "fixture/";
+    private static final String[] INCLUDE_PREFIXES = {
+        "fixture/", // local coverage fixture
+        "ls/", // the language server itself
+        "dotty/tools/", // Scala 3 presentation compiler
+        "scala/meta/", // scalameta / semanticdb
+    };
     // Fixed, versioned seed so block ids are stable across JVM launches.
-    private static final long AGENT_SEED = 1125899906842597L;
+    private static final long SEED = 1125899906842597L;
 
     private CoverageAgent() {}
 
@@ -33,11 +40,20 @@ public final class CoverageAgent {
     }
 
     static int stableId(String key) {
-        long h = AGENT_SEED;
+        long h = SEED;
         for (int i = 0; i < key.length(); i++) {
             h = 31 * h + key.charAt(i);
         }
         return (int) (h & (Cov.MAP_SIZE - 1));
+    }
+
+    private static boolean included(String className) {
+        for (String prefix : INCLUDE_PREFIXES) {
+            if (className.startsWith(prefix)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     static final class EdgeTransformer implements ClassFileTransformer {
@@ -48,15 +64,17 @@ public final class CoverageAgent {
                 Class<?> classBeingRedefined,
                 ProtectionDomain protectionDomain,
                 byte[] classfileBuffer) {
-            if (className == null || !className.startsWith(INCLUDE_PREFIX)) {
+            if (className == null || !included(className)) {
                 return null;
             }
             try {
+                int classId = stableId(className);
+                Cov.registerClass(classId, className.replace('/', '.'));
                 ClassReader reader = new ClassReader(classfileBuffer);
-                // COMPUTE_FRAMES: inserting hits at block leaders shifts offsets and can invalidate
+                // COMPUTE_FRAMES: inserting probes at block leaders shifts offsets and invalidates
                 // the original StackMapTable, which the JDK 25 verifier rejects; recompute frames.
                 ClassWriter writer = new ClassWriter(reader, ClassWriter.COMPUTE_FRAMES);
-                reader.accept(new CovClassVisitor(writer, className), 0);
+                reader.accept(new CovClassVisitor(writer, className, classId), 0);
                 return writer.toByteArray();
             } catch (Throwable t) {
                 // Never break class loading because of instrumentation.
@@ -67,10 +85,12 @@ public final class CoverageAgent {
 
     static final class CovClassVisitor extends ClassVisitor {
         private final String className;
+        private final int classId;
 
-        CovClassVisitor(ClassVisitor next, String className) {
+        CovClassVisitor(ClassVisitor next, String className, int classId) {
             super(Opcodes.ASM9, next);
             this.className = className;
+            this.classId = classId;
         }
 
         @Override
@@ -81,11 +101,11 @@ public final class CoverageAgent {
                 return null;
             }
             String method = className + "#" + name + descriptor;
+            int cid = classId;
             return new MethodVisitor(Opcodes.ASM9, mv) {
                 // Deterministic basic-block ordinal within this method. Combined with the method
-                // key it yields stable per-block ids across JVM launches (task4 doc), so the
-                // inserted `Cov.hit` sequence — LDC + INVOKESTATIC (I)V, stack-neutral — never
-                // needs recomputed frames.
+                // key it yields stable per-block ids across JVM launches; the inserted probe
+                // sequence (LDC + INVOKESTATIC (I)V) is stack-neutral.
                 private int blockOrdinal = 0;
 
                 private void emitHit() {
@@ -97,11 +117,13 @@ public final class CoverageAgent {
                 @Override
                 public void visitCode() {
                     super.visitCode();
+                    visitLdcInsn(cid);
+                    visitMethodInsn(Opcodes.INVOKESTATIC, "cov/Cov", "cls", "(I)V", false);
                     emitHit(); // method entry block
                 }
 
                 @Override
-                public void visitLabel(org.objectweb.asm.Label label) {
+                public void visitLabel(Label label) {
                     super.visitLabel(label);
                     emitHit(); // block leader (branch/jump target, loop head, handler entry)
                 }

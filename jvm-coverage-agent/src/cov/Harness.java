@@ -15,11 +15,11 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 
 /**
- * task5 verifier: drives the persistent {@link WorkerHandle} over its control protocol and asserts
- * the full task5 property set — saturation, non-empty/deterministic/input-sensitive coverage, an
- * LSPFuzz-sized transport payload, a 1000-identical-input stability gate with bounded thread/fd
- * growth, outcome classification with timeout kill + epoch restart, and saved-input cold replay.
- * Not instrumented. Exit code 0 iff every gate passes.
+ * Coverage worker harness: drives the persistent {@link WorkerHandle} over its control protocol and
+ * asserts the full property set — saturation, non-empty/deterministic/input-sensitive coverage, a
+ * large transport payload, a 1000-identical-input stability gate with bounded thread/fd growth,
+ * outcome classification with timeout kill + epoch restart, and saved-input cold replay. Not
+ * instrumented. Exit code 0 iff every gate passes.
  */
 public final class Harness {
     private static final int MAP_SIZE = Cov.MAP_SIZE;

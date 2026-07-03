@@ -14,9 +14,9 @@ import java.util.stream.Stream;
 import fixture.Target;
 
 /**
- * Persistent JVM worker — the JVM half of the Option-B bridge (the Rust LibAFL executor is task7/8).
- * It loops over a tiny binary control protocol on stdio so the same warmed, agent-instrumented JVM
- * serves many inputs without restart:
+ * Persistent JVM worker — a warmed, agent-instrumented server. It loops over a tiny binary control
+ * protocol on stdio so the same JVM serves many inputs without restart (the Rust-side executor
+ * connects to this protocol):
  *
  * <pre>
  *   request  : 'R' u32be(len) bytes[len]        run one input

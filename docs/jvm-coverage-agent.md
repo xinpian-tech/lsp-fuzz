@@ -79,7 +79,34 @@ tighten excludes or raise `MAP_SIZE` (§3).
   lower-fidelity stopgap while the custom agent is fixed.
 - Map saturation from over-broad instrumentation → tighten §2 excludes or raise `MAP_SIZE` to 2^18.
 
-## Next (task5)
-Build a trivial instrumented JVM worker/fixture and prove: non-empty stable AFL-shaped coverage,
-LSPFuzz-sized input transport, crash classification, timeout kill/restart, bounded resources, and
-1000-identical-input coverage stability — then task6 runs it on the real `ls.core.Main`.
+## Real-LS results and reset/map/thread-safety notes
+
+Verified against the real `scala3-bsp-smantic-ls` jar under JDK 25 (`run-real-ls.sh`, agent include
+filter widened to `ls/` + `dotty/tools/` + `scala/meta/`):
+
+- **Coverage works on the real LS**: instrumenting `ls.core.Main` and driving an LSP
+  initialize/didOpen/completion/shutdown session produces a non-empty map and a covered-class set
+  reaching the server's semantic layers (`ls.pc.*` PC facade/worker manager, `ls.rename.*`,
+  `ls.sqlite`, `ls.postings`, `ls.bsp`). The covered-class set is byte-identical across two fresh
+  JVM epochs (deterministic).
+- **Map size / counter model**: `2^16` entries, 8-bit saturating counters (unchanged from the
+  design; validated on the real classpath).
+- **Reset boundary**: in the persistent worker, `Cov.reset()` runs per input (map + prev + covered
+  set). For the real-LS run the agent instead dumps at JVM shutdown, which is why the real-LS proof
+  uses a fresh epoch per measurement.
+- **Thread-safety**: counter increments are racy on purpose (AFL semantics); the covered-class set
+  is a `ConcurrentHashMap.newKeySet()` because the compiler/BSP background threads touch it.
+
+### Finding: the presentation compiler is gated on BSP
+
+The LS logs `no BSP connection ... PC is disabled` and answers `textDocument/completion` with an
+empty result when there is no BSP connection. So the plan's Régime 1 ("presentation-compiler
+paths, no BSP") is **not achievable with this LS**: reaching the compiler internals
+(`dotty.tools.*` / `scala.meta.*`) requires a BSP-backed workspace. Compiler-internal coverage is
+therefore folded into the BSP backdrop work (the frozen zaozi SemanticDB + BSP snapshot); the
+agent itself is proven ready for it (the include filter already covers those packages).
+
+## Next
+Build the Rust-side JVM executor/observer/feedback that speaks the worker control protocol, and
+stand up the BSP backdrop so the presentation compiler is enabled and `dotty.tools`/`scala.meta`
+coverage can be measured.

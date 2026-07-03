@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Build the ASM bytecode-coverage agent + persistent worker + fixture, then run the task5 harness
+# Build the ASM bytecode-coverage agent + persistent worker + fixture, then run the harness
 # which asserts: saturating counters, non-empty/deterministic/input-sensitive basic-block coverage,
 # a 1000-identical-input stability gate, outcome classification (normal/crash/hang-timeout+restart),
 # and cold replay from a fresh JVM. See docs/jvm-coverage-agent.md.
@@ -26,5 +26,5 @@ mkdir -p agentjar/META-INF
 printf 'Premain-Class: cov.CoverageAgent\nCan-Retransform-Classes: true\n' > agentjar/META-INF/MANIFEST.MF
 ( cd agentjar && jar cfm ../agent.jar META-INF/MANIFEST.MF cov org )
 
-# The harness spawns agent-instrumented worker JVMs and asserts every task5 gate.
+# The harness spawns agent-instrumented worker JVMs and asserts every coverage gate.
 java -cp out cov.Harness
