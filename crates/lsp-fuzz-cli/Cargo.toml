@@ -17,6 +17,7 @@ libafl = { workspace = true, features = ["clap"] }
 libafl_bolts.workspace = true
 libcasr.workspace = true
 lsp-fuzz = { path = "../lsp-fuzz" }
+tree-sitter.workspace = true
 lsp-fuzz-grammars = { path = "../lsp-fuzz-grammars" }
 memmap2.workspace = true
 nix.workspace = true

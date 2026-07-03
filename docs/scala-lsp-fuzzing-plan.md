@@ -1,6 +1,17 @@
 # Plan: Scala LSP Support for LSPFuzz
 
-Status: proposal / not yet implemented.
+> **Status / authority.** `rlcr.md` at the repo root is the authoritative, converged plan and
+> supersedes this draft. This document is kept for background rationale only.
+>
+> **Architecture correction (Option B).** The JVM coverage bridge does **not** reuse the AFL
+> fork-server executor. Coverage comes from a JVM **bytecode agent**; its map is surfaced to
+> LSPFuzz through a **new JVM-specific LibAFL `Executor`** (a sibling of `LspExecutor`) with its
+> own control protocol. That executor path **bypasses** `check_binary`, the ELF AFL-signature
+> scan, and `AFL_DUMP_MAP_SIZE` — those belong to the native forkserver path only. Wherever the
+> sections below mention "route A", `LspExecutor` / `NeoForkServer`, fds 198/199,
+> `__AFL_SHM_FUZZ_ID`, or `--persistent/--defer/--map-size` overrides as the JVM route, read them
+> as background on the *native* model, not as guidance for the Scala JVM target. See `rlcr.md`
+> (DEC-1 = Option B) and `docs/jvm-target.md`.
 
 ## 1. Goal & fixed decisions
 

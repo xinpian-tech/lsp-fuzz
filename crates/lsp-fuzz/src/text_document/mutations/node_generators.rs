@@ -127,7 +127,7 @@ mod tests {
             .find_map(|child| find_node_with_fragments(child, ctx))
     }
 
-    /// AC-8: a Scala fragment corpus, loaded into a `GrammarContextLookup`, must feed
+    /// A Scala fragment corpus, loaded into a `GrammarContextLookup`, must feed
     /// `ChooseFromDerivations` so a Scala node mutation selects a fragment from that corpus.
     #[test]
     fn choose_from_scala_corpus() {

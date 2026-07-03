@@ -1100,6 +1100,7 @@ dependencies = [
  "tempfile",
  "tracing",
  "tracing-subscriber",
+ "tree-sitter 0.26.9",
  "tuple_list",
  "walkdir",
  "zstd",
