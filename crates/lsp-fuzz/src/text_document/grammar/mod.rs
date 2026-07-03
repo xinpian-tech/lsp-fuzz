@@ -290,5 +290,14 @@ mod tests {
     fn malformed_scala_grammar_rejected() {
         // Malformed grammar JSON must be rejected with an error, not accepted.
         assert!(Grammar::from_tree_sitter_grammar_json(Language::Scala, "{ not json").is_err());
+        // A well-formed but empty grammar (no rules) must also be rejected with a
+        // clean error rather than panicking during preparation.
+        assert!(matches!(
+            Grammar::from_tree_sitter_grammar_json(
+                Language::Scala,
+                r#"{"name":"scala","rules":{}}"#
+            ),
+            Err(CreationError::EmptyGrammar)
+        ));
     }
 }

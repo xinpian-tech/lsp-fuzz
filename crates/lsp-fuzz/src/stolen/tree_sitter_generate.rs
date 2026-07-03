@@ -28,6 +28,11 @@ impl Grammar {
     ) -> Result<Self, CreationError> {
         let input_grammar =
             parse_grammar(grammar_json).map_err(|e| CreationError::TreeSitter(e.into()))?;
+        // `prepare_grammar` indexes the first rule unconditionally, so an empty
+        // grammar must be rejected here rather than panicking downstream.
+        if input_grammar.variables.is_empty() {
+            return Err(CreationError::EmptyGrammar);
+        }
         let (syntax_grammar, lexical_grammar, _inlined_prod, aliases) =
             prepare_grammar(&input_grammar).map_err(|e| CreationError::TreeSitter(e.into()))?;
         Self::from_tree_sitter_grammar(language, &syntax_grammar, &lexical_grammar, &aliases)
