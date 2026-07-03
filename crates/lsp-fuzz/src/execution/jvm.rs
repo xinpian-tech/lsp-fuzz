@@ -19,7 +19,9 @@
 use std::{
     io::{self, Read, Write},
     path::{Path, PathBuf},
-    process::{Child, Command, Stdio},
+    process::{Child, ChildStdin, Command, Stdio},
+    sync::mpsc::{Receiver, RecvTimeoutError, channel},
+    thread::JoinHandle,
     time::Duration,
 };
 
@@ -189,11 +191,62 @@ impl RunResult {
                     .map_err(|_| WorkerError::Protocol)?,
             ));
         }
+        // Fail closed on a reply that is longer than the declared payload.
+        if !cursor.is_empty() {
+            return Err(WorkerError::Protocol);
+        }
         Ok(RunResult {
             status,
             iteration_id,
             nonzero_edges,
             covered_classes,
+        })
+    }
+}
+
+/// The worker's reply to a [`Request::Status`]: a resource snapshot used for leak / bounded-resource
+/// health checks (mirrors the worker's `S` reply).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WorkerHealth {
+    pub used_heap: u64,
+    pub threads: u32,
+    pub open_fds: u64,
+}
+
+impl WorkerHealth {
+    /// Encode as `<used_heap:u64-le><threads:u32-le><open_fds:u64-le>`.
+    #[must_use]
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(20);
+        out.extend_from_slice(&self.used_heap.to_le_bytes());
+        out.extend_from_slice(&self.threads.to_le_bytes());
+        out.extend_from_slice(&self.open_fds.to_le_bytes());
+        out
+    }
+
+    /// Decode a health reply produced by [`WorkerHealth::encode`]. Fails closed on the wrong length.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkerError::Protocol`] if `bytes` is not exactly 20 bytes.
+    pub fn decode(bytes: &[u8]) -> Result<WorkerHealth, WorkerError> {
+        if bytes.len() != 20 {
+            return Err(WorkerError::Protocol);
+        }
+        let field = |range: std::ops::Range<usize>| -> Result<[u8; 8], WorkerError> {
+            let mut buf = [0u8; 8];
+            let slice = &bytes[range];
+            buf[..slice.len()].copy_from_slice(slice);
+            Ok(buf)
+        };
+        let used_heap = u64::from_le_bytes(field(0..8)?);
+        let threads =
+            u32::from_le_bytes(bytes[8..12].try_into().map_err(|_| WorkerError::Protocol)?);
+        let open_fds = u64::from_le_bytes(field(12..20)?);
+        Ok(WorkerHealth {
+            used_heap,
+            threads,
+            open_fds,
         })
     }
 }
@@ -319,6 +372,20 @@ impl<T: WorkerTransport + std::fmt::Debug> JvmWorker<T> {
         }
     }
 
+    /// Request a worker health snapshot (used heap / live threads / open fds) for leak and
+    /// bounded-resource monitoring.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkerError::Timeout`] if the worker does not answer within the run deadline, or
+    /// [`WorkerError::Protocol`]/[`WorkerError::Io`] on a malformed or failed exchange.
+    pub fn status(&mut self) -> Result<WorkerHealth, WorkerError> {
+        let reply = self
+            .transport
+            .request(&Request::Status, self.run_deadline)?;
+        WorkerHealth::decode(&reply)
+    }
+
     /// Copy the coverage map out of the shared mmap file. The caller invokes this only when the
     /// preceding [`JvmWorker::run`] returned `coverage_attributable`.
     ///
@@ -340,50 +407,94 @@ impl<T: WorkerTransport + std::fmt::Debug> JvmWorker<T> {
 }
 
 /// A transport backed by a real worker subprocess speaking the control protocol over stdin/stdout.
+///
+/// A persistent reader thread owns the child's stdout and pushes each complete length-prefixed
+/// reply frame onto a channel, so [`WorkerTransport::request`] can bound its wait with the deadline
+/// (`recv_timeout`) instead of blocking forever on a hung worker. On a deadline miss the caller
+/// restarts the epoch, which [`WorkerTransport::kill`] performs.
 #[derive(Debug)]
 pub struct SubprocessTransport {
     child: Child,
+    stdin: Option<ChildStdin>,
+    replies: Receiver<io::Result<Vec<u8>>>,
+    reader: Option<JoinHandle<()>>,
 }
 
 impl SubprocessTransport {
-    /// Spawn the worker process. The worker is expected to read framed requests from stdin and
-    /// write framed replies to stdout.
+    /// Spawn the worker process. The worker reads framed requests from stdin and writes framed
+    /// replies (`<u32-le len><bytes>`) to stdout.
     ///
     /// # Errors
     ///
     /// Returns any error from spawning the process.
     pub fn spawn(mut command: Command) -> Result<SubprocessTransport, WorkerError> {
-        let child = command
+        let mut child = command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .spawn()?;
-        Ok(SubprocessTransport { child })
+        let stdin = child.stdin.take().ok_or(WorkerError::Protocol)?;
+        let mut stdout = child.stdout.take().ok_or(WorkerError::Protocol)?;
+        let (tx, rx) = channel();
+        // The reader loop reads one framed reply at a time and forwards it. When the child dies or
+        // stdout closes, `read_exact` errors and the loop forwards that error then exits; a hung
+        // child simply never sends, and the caller's `recv_timeout` fires instead.
+        let reader = std::thread::spawn(move || {
+            loop {
+                let mut len_buf = [0u8; 4];
+                if let Err(err) = stdout.read_exact(&mut len_buf) {
+                    let _ = tx.send(Err(err));
+                    return;
+                }
+                let len = u32::from_le_bytes(len_buf) as usize;
+                let mut reply = vec![0u8; len];
+                if let Err(err) = stdout.read_exact(&mut reply) {
+                    let _ = tx.send(Err(err));
+                    return;
+                }
+                if tx.send(Ok(reply)).is_err() {
+                    return; // receiver dropped: transport gone
+                }
+            }
+        });
+        Ok(SubprocessTransport {
+            child,
+            stdin: Some(stdin),
+            replies: rx,
+            reader: Some(reader),
+        })
     }
 }
 
 impl WorkerTransport for SubprocessTransport {
-    fn request(&mut self, request: &Request, _deadline: Duration) -> Result<Vec<u8>, WorkerError> {
-        // Deadline enforcement for the blocking pipe is the executor's responsibility (a watchdog
-        // that kills the child on timeout); this transport performs the framed exchange. Reading a
-        // run reply requires the length-prefixed reply framing the worker emits.
-        let stdin = self.child.stdin.as_mut().ok_or(WorkerError::Protocol)?;
-        stdin.write_all(&request.encode())?;
-        stdin.flush()?;
+    fn request(&mut self, request: &Request, deadline: Duration) -> Result<Vec<u8>, WorkerError> {
+        // Drop any reply left over from a previous request (e.g. one that arrived after a timeout)
+        // so this request's reply is the one recv'd below. After a timeout the caller restarts the
+        // epoch anyway, so this is belt-and-suspenders.
+        while self.replies.try_recv().is_ok() {}
+        {
+            let stdin = self.stdin.as_mut().ok_or(WorkerError::Protocol)?;
+            stdin.write_all(&request.encode())?;
+            stdin.flush()?;
+        }
         if matches!(request, Request::Quit) {
             return Ok(Vec::new());
         }
-        let stdout = self.child.stdout.as_mut().ok_or(WorkerError::Protocol)?;
-        let mut len_buf = [0u8; 4];
-        stdout.read_exact(&mut len_buf)?;
-        let len = u32::from_le_bytes(len_buf) as usize;
-        let mut reply = vec![0u8; len];
-        stdout.read_exact(&mut reply)?;
-        Ok(reply)
+        match self.replies.recv_timeout(deadline) {
+            Ok(Ok(reply)) => Ok(reply),
+            Ok(Err(err)) => Err(WorkerError::Io(err)),
+            Err(RecvTimeoutError::Timeout) => Err(WorkerError::Timeout),
+            Err(RecvTimeoutError::Disconnected) => Err(WorkerError::Protocol),
+        }
     }
 
     fn kill(&mut self) {
+        // Dropping stdin signals EOF; killing + waiting reaps the child, which ends the reader.
+        self.stdin = None;
         let _ = self.child.kill();
         let _ = self.child.wait();
+        if let Some(reader) = self.reader.take() {
+            let _ = reader.join();
+        }
     }
 }
 
@@ -602,5 +713,80 @@ mod tests {
         long.write_all(&vec![0u8; MAP_SIZE + 1]).unwrap();
         long.flush().unwrap();
         assert!(matches!(read_map(long.path()), Err(WorkerError::Protocol)));
+    }
+
+    #[test]
+    fn decode_rejects_trailing_bytes() {
+        let mut wire = RunResult {
+            status: WorkerStatus::OkSnapshot,
+            iteration_id: 1,
+            nonzero_edges: 0,
+            covered_classes: vec![],
+        }
+        .encode();
+        wire.push(0xAB); // one byte past the declared payload
+        assert!(matches!(
+            RunResult::decode(&wire),
+            Err(WorkerError::Protocol)
+        ));
+    }
+
+    #[test]
+    fn worker_health_round_trip_and_truncation() {
+        let health = WorkerHealth {
+            used_heap: 123_456_789,
+            threads: 6,
+            open_fds: 42,
+        };
+        assert_eq!(WorkerHealth::decode(&health.encode()).unwrap(), health);
+        assert!(matches!(
+            WorkerHealth::decode(&[0u8; 19]),
+            Err(WorkerError::Protocol)
+        ));
+        assert!(matches!(
+            WorkerHealth::decode(&[0u8; 21]),
+            Err(WorkerError::Protocol)
+        ));
+    }
+
+    #[test]
+    fn status_decodes_health_reply() {
+        let health = WorkerHealth {
+            used_heap: 1 << 30,
+            threads: 8,
+            open_fds: 12,
+        };
+        let mut worker = JvmWorker::new(
+            MockTransport::new(vec![Ok(health.encode())]),
+            "/nonexistent/map",
+            Duration::from_secs(1),
+        );
+        assert_eq!(worker.status().unwrap(), health);
+    }
+
+    /// The real subprocess transport must honor the deadline: a worker that accepts the request and
+    /// never replies yields `WorkerError::Timeout` within the deadline, and `kill()` terminates it
+    /// without hanging. `sleep` ignores stdin and never writes stdout, standing in for a hung worker.
+    #[test]
+    fn subprocess_transport_deadline_times_out_and_kills() {
+        use std::time::Instant;
+        let mut command = Command::new("sleep");
+        command.arg("100");
+        // `sleep` unavailable in this environment: skip.
+        let Ok(mut transport) = SubprocessTransport::spawn(command) else {
+            return;
+        };
+        let start = Instant::now();
+        let result = transport.request(&Request::Run(vec![1, 2, 3]), Duration::from_millis(50));
+        assert!(
+            matches!(result, Err(WorkerError::Timeout)),
+            "hung worker must time out, got {result:?}"
+        );
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "request should return promptly at the deadline"
+        );
+        // Must terminate the child and join the reader thread without hanging.
+        transport.kill();
     }
 }
