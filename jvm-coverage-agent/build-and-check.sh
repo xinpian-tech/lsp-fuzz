@@ -36,9 +36,9 @@ printf 'abc' > in1b
 printf 'z'   > in2
 
 FLAGS="-XX:-UseCompactObjectHeaders -Xshare:off -XX:+UseSerialGC --enable-native-access=ALL-UNNAMED"
-COV_MAP_PATH=map1.bin  java $FLAGS -javaagent:agent.jar -cp out target.Target < in1
-COV_MAP_PATH=map1b.bin java $FLAGS -javaagent:agent.jar -cp out target.Target < in1b
-COV_MAP_PATH=map2.bin  java $FLAGS -javaagent:agent.jar -cp out target.Target < in2
+COV_MAP_PATH=map1.bin  java $FLAGS -javaagent:agent.jar -cp out fixture.Target < in1
+COV_MAP_PATH=map1b.bin java $FLAGS -javaagent:agent.jar -cp out fixture.Target < in1b
+COV_MAP_PATH=map2.bin  java $FLAGS -javaagent:agent.jar -cp out fixture.Target < in2
 
 fail=0
 if cmp -s map1.bin zero.bin; then echo "FAIL: coverage map is empty"; fail=1; else

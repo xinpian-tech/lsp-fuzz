@@ -16,12 +16,12 @@ import org.objectweb.asm.Opcodes;
  * from class+method+descriptor so identical runs produce byte-identical maps (AC-2 stability,
  * AC-5 cold replay).
  *
- * <p>First slice: instruments only the trivial fixture package ({@code target/}). The real
+ * <p>First slice: instruments only the trivial fixture package ({@code fixture/}). The real
  * include/exclude scope (ls / dotty.tools / scala.meta / lsp4j / bsp4j) is applied in task6.
  */
 public final class CoverageAgent {
 
-    private static final String INCLUDE_PREFIX = "target/";
+    private static final String INCLUDE_PREFIX = "fixture/";
     // Fixed, versioned seed so block ids are stable across JVM launches.
     private static final long AGENT_SEED = 1125899906842597L;
 
