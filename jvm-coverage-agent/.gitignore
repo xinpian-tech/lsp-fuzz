@@ -6,3 +6,6 @@ in1
 in1b
 in2
 .jvm-cache/
+ls-classes-*.txt
+ls-out-*.log
+.scala3-bsp-semantic-ls/
