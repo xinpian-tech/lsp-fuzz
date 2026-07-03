@@ -28,6 +28,7 @@ rust-project.json
 
 # Local build/dev caches and transient tool outputs
 .cargo-home/
+.jvm-cache/
 /result
 result-*
 .humanize*
