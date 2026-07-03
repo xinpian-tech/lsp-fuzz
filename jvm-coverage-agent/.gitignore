@@ -9,3 +9,7 @@ in2
 ls-classes-*.txt
 ls-out-*.log
 .scala3-bsp-semantic-ls/
+.bsp-ws/
+bsp-*.bin
+bsp-*.txt
+bsp-*.log

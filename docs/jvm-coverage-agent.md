@@ -112,10 +112,22 @@ The LS logs `no BSP connection ... PC is disabled` and answers `textDocument/com
 empty result when there is no BSP connection. So the plan's Régime 1 ("presentation-compiler
 paths, no BSP") is **not achievable with this LS**: reaching the compiler internals
 (`dotty.tools.*` / `scala.meta.*`) requires a BSP-backed workspace. Compiler-internal coverage is
-therefore folded into the BSP backdrop work (the frozen zaozi SemanticDB + BSP snapshot); the
-agent itself is proven ready for it (the include filter already covers those packages).
+therefore folded into the BSP backdrop work. The include filter already lists those packages, but
+whether the agent's ASM transformation actually succeeds on them is **unproven until they load** —
+it will be confirmed by the first BSP-positive run (they did not load in the no-BSP control).
+
+### BSP connection reached (progress toward compiler coverage)
+
+With a minimal BSP-backed Scala 3 Mill workspace (`setup-bsp-workspace.sh` runs
+`mill mill.bsp.BSP/install`), the LS **does** establish BSP — the log shows `bsp] BSP server
+started` and `Build initialized`, and the `PC is disabled` message is gone. Covered classes grow
+(≈65 → ≈87, more `ls.bsp.*`). However, `textDocument/completion` still returns an empty result and
+no `dotty.tools.*`/`scala.meta.*` classes load yet: the presentation compiler is not producing
+results at the moment completion fires, most likely because the target's first BSP compile /
+classpath resolution has not completed. **Next step:** drive a build (or wait for the BSP
+`compile`/reindex to finish) before requesting completion, then confirm compiler-internal coverage.
 
 ## Next
-Build the Rust-side JVM executor/observer/feedback that speaks the worker control protocol, and
-stand up the BSP backdrop so the presentation compiler is enabled and `dotty.tools`/`scala.meta`
-coverage can be measured.
+- Get the BSP-positive run to actually produce PC completions (compile-readiness), confirming
+  `dotty.tools`/`scala.meta` coverage — the `run-real-ls.sh` positive gate is wired for this.
+- Build the Rust-side JVM executor/observer/feedback that speaks the worker control protocol.
