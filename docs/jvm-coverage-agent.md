@@ -14,7 +14,10 @@ the **coverage source only**; its map is read by a new JVM-specific LibAFL execu
 
 ## 1. DECISION
 Use a **custom `java.lang.instrument` + ASM `ClassFileTransformer` agent** (Kelinci-style), pinned
-to **ASM ≥ 9.7** (class-file major 69 / JDK 25 support). Not Jazzer, not JaCoCo:
+to **ASM 9.8** — the first ASM release with explicit Java 24/25 support (class-file major 69 /
+`Opcodes.V25`); the transformer uses the `Opcodes.ASM9` API level. (ASM 9.7 / 9.7.1 only reach
+Java 23 and reject major-69 classes, so the `>= 9.7` lower bound from the first draft is wrong for
+JDK 25.) Not Jazzer, not JaCoCo:
 
 - **Jazzer** is libFuzzer-oriented; its coverage is bound to its own driver/`CoverageMap`, and its
   JDK support historically lags new releases (JDK 25 is brand new). Reusing it purely as a
@@ -42,8 +45,15 @@ tighten excludes or raise `MAP_SIZE` (§3).
 
 ## 3. COVERAGE_MAP (the contract the Rust executor depends on)
 - `MAP_SIZE = 2^16` (65536), AFL default; 8-bit **saturating** counters.
-- Edge scheme: `cur = <compile-time-random block id>`; on each edge
-  `counters[(prev ^ cur) & (MAP_SIZE-1)] += 1` (saturating); `prev = cur >> 1`.
+- Edge scheme: each basic block gets a **deterministic** id (this is a runtime
+  `ClassFileTransformer`, not AFL compile-time instrumentation, so ids must NOT come from load
+  order or a runtime RNG or the map would differ across JVM epochs and break AC-2 stability and
+  AC-5 cold-replay/provenance). Derive `blockId = truncate16(stableHash(className + "#" +
+  methodName + methodDescriptor + "@" + basicBlockOrdinal, AGENT_SEED))` where `AGENT_SEED` is a
+  fixed, versioned constant baked into the agent. On each edge
+  `counters[(prev ^ cur) & (MAP_SIZE-1)] += 1` (saturating), with `prev = cur >> 1`. Because the
+  hash inputs are stable per class/method, the same code always instruments to the same ids on
+  every JVM launch, so identical inputs produce byte-identical maps and cold replay reproduces.
 - Exposed to Rust as a **memory-mapped file** whose path is passed to the JVM worker by the
   executor via an env var; both sides `mmap` it. (A `MemorySegment` over the same file on the JVM
   side; a plain shared slice on the Rust side — this is the executor's `Observer` map in task8.)
