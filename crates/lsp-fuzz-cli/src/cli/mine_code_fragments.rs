@@ -150,3 +150,56 @@ fn extract_fragments<'a>(
         }),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// End-to-end round trip for Scala: discover a `.scala` file, extract
+    /// derivation fragments, serialize them to disk in the on-disk format, and
+    /// load them back through the fuzzer's grammar-context loader.
+    #[test]
+    fn mine_and_load_scala_fragments_round_trip() {
+        const SCALA_SRC: &str = r"
+object Demo:
+  def add(a: Int, b: Int): Int = a + b
+  val xs: List[Int] = List(1, 2, 3)
+";
+        let dir =
+            std::env::temp_dir().join(format!("lspfuzz_scala_frag_test_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let src_path = dir.join("Demo.scala");
+        std::fs::write(&src_path, SCALA_SRC).expect("write scala source");
+
+        let files = find_source_files(&dir, Language::Scala).expect("find source files");
+        assert_eq!(files.len(), 1, "the .scala file should be discovered");
+
+        let (content, file_fragments) = extract_fragments(&src_path, Language::Scala)
+            .expect("extract fragments")
+            .expect("Scala source yields fragments");
+        assert!(
+            !file_fragments.is_empty(),
+            "Scala source should produce derivation fragments"
+        );
+
+        let mut code = Vec::new();
+        let mut fragments = HashMap::new();
+        code.extend(content);
+        for (node_kind, ranges) in file_fragments {
+            fragments
+                .entry(node_kind)
+                .or_insert_with(Vec::new)
+                .extend(ranges);
+        }
+        let frags = DerivationFragments::new(code, fragments);
+
+        let out = dir.join("scala.frag");
+        write_output(&out, &frags, 1).expect("serialize fragments");
+
+        // The fuzzer's load path must accept the mined Scala fragments.
+        crate::language_fragments::load_grammar_context(Language::Scala, &out)
+            .expect("load grammar context for Scala");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+}

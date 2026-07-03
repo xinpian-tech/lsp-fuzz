@@ -30,4 +30,4 @@ rust-project.json
 .cargo-home/
 /result
 result-*
-.humanize/skill/
+.humanize*
