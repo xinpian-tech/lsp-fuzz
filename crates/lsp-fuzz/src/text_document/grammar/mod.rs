@@ -180,6 +180,7 @@ mod tests {
             Language::LaTeX,
             Language::BibTeX,
             Language::Solidity,
+            Language::Scala,
         ];
         for language in languages {
             let grammar =
@@ -210,6 +211,21 @@ mod tests {
         let node = capture_iter.next().expect("There is one keyword node");
         let text = &doc.content()[node.byte_range()];
         assert_eq!(text, b"fn");
+        assert!(capture_iter.next().is_none());
+    }
+
+    #[test]
+    fn capture_scala() {
+        const SCALA_CODE: &str = r#"
+            // Hello
+            object Main:
+              def main(args: Array[String]): Unit = println("Hello, world!")
+        "#;
+        let doc = TextDocument::new(Language::Scala, SCALA_CODE.as_bytes().to_vec());
+        let mut capture_iter = CapturesIterator::new(&doc, "comment").unwrap();
+        let node = capture_iter.next().expect("There is one comment node");
+        let text = &doc.content()[node.byte_range()];
+        assert_eq!(text, b"// Hello");
         assert!(capture_iter.next().is_none());
     }
 }

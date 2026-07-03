@@ -20,6 +20,7 @@ pub enum Language {
     Solidity,
     MLIR,
     QML,
+    Scala,
 }
 
 /// Well-known highlight capture names.

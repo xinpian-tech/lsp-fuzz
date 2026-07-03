@@ -125,3 +125,12 @@ pub const QML: LanguageInfo = LanguageInfo {
     lsp_language_id: "qml",
     ts_language_fn: tree_sitter_qmljs::LANGUAGE,
 };
+
+/// The Scala language information
+pub const SCALA: LanguageInfo = LanguageInfo {
+    grammar_json: include_grammar_json!("scala"),
+    extensions: &["scala", "sc"],
+    highlight_query: tree_sitter_scala::HIGHLIGHTS_QUERY,
+    lsp_language_id: "scala",
+    ts_language_fn: tree_sitter_scala::LANGUAGE,
+};

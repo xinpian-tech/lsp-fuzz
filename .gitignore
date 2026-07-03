@@ -25,3 +25,9 @@ rust-project.json
 
 
 # End of https://www.toptal.com/developers/gitignore/api/rust,rust-analyzer
+
+# Local build/dev caches and transient tool outputs
+.cargo-home/
+/result
+result-*
+.humanize/skill/

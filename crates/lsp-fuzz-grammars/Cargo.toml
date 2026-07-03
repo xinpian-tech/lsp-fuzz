@@ -20,6 +20,7 @@ tree-sitter-mlir = { git = "https://github.com/henryhchchc/tree-sitter-mlir.git"
 tree-sitter-qmljs = { git = "https://github.com/henryhchchc/tree-sitter-qmljs.git", branch = "master" }
 tree-sitter-ruby = "0.23.1"
 tree-sitter-rust = "0.24.2"
+tree-sitter-scala = "0.26.0"
 tree-sitter-solidity = "1.2.13"
 tree-sitter-systemverilog = "0.3.1"
 tree-sitter-toml-ng = "0"

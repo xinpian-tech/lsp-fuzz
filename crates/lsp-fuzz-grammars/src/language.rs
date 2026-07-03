@@ -30,6 +30,7 @@ impl Language {
             Language::Solidity => language_data::SOLIDITY,
             Language::MLIR => language_data::MLIR,
             Language::QML => language_data::QML,
+            Language::Scala => language_data::SCALA,
         }
     }
 
@@ -63,7 +64,7 @@ impl Language {
     /// Panics if the bundled highlight query for this language is invalid.
     #[must_use]
     pub fn ts_highlight_query(self) -> &'static tree_sitter::Query {
-        const VARIANT_COUNT: usize = 12;
+        const VARIANT_COUNT: usize = 13;
         // Use `variant_count` when stabilized.
         // static QUERIES: [OnceLock<tree_sitter::Query>; variant_count::<Language>()] =
         //     [const { OnceLock::new() }; variant_count::<Language>()];
