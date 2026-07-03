@@ -59,9 +59,14 @@ impl Language {
     /// - [Neovim](https://neovim.io/doc/user/treesitter.html#treesitter-highlight-groups)
     /// - [Zed](https://zed.dev/docs/extensions/languages#syntax-highlighting)
     ///
+    /// If a bundled highlight query fails to compile against its grammar (e.g. it references node
+    /// types absent from the pinned grammar version), this degrades to an empty query instead of
+    /// panicking, so highlight-driven mutation for other languages is unaffected.
+    ///
     /// # Panics
     ///
-    /// Panics if the bundled highlight query for this language is invalid.
+    /// Only if constructing an *empty* query for this language's grammar fails, which does not
+    /// happen for any valid tree-sitter grammar.
     #[must_use]
     pub fn ts_highlight_query(self) -> &'static tree_sitter::Query {
         const VARIANT_COUNT: usize = 13;
@@ -73,11 +78,36 @@ impl Language {
 
         let query_idx = (self as u8) as usize;
         QUERIES[query_idx].get_or_init(|| {
+            let language = self.ts_language();
             let query_src = self.info().highlight_query;
-            tree_sitter::Query::new(&self.ts_language(), query_src)
-                .expect("The query provided by tree-sitter should be correct")
+            tree_sitter::Query::new(&language, query_src).unwrap_or_else(|err| {
+                // A malformed bundled query must not crash the whole fuzzer. Fall back to an empty
+                // (always-valid) query so this language simply contributes no highlight context.
+                eprintln!(
+                    "warning: highlight query for {self} is invalid ({err}); using an empty query"
+                );
+                tree_sitter::Query::new(&language, "")
+                    .expect("an empty highlight query is always valid")
+            })
         })
     }
+
+    /// Every `Language` variant, in `#[repr(u8)]` order.
+    pub const ALL: [Language; 13] = [
+        Language::C,
+        Language::CPlusPlus,
+        Language::JavaScript,
+        Language::Ruby,
+        Language::Rust,
+        Language::Toml,
+        Language::LaTeX,
+        Language::BibTeX,
+        Language::Verilog,
+        Language::Solidity,
+        Language::MLIR,
+        Language::QML,
+        Language::Scala,
+    ];
 
     #[must_use]
     pub fn ts_language(self) -> tree_sitter::Language {

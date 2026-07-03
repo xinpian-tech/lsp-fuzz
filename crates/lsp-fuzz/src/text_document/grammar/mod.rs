@@ -262,6 +262,29 @@ mod tests {
         );
     }
 
+    /// `ts_highlight_query()` must return for every `Language` variant without panicking or
+    /// indexing out of bounds. This walks the full `QUERIES` array (so a stale `VARIANT_COUNT`
+    /// smaller than the enum would panic), and covers variants whose bundled query is invalid: a
+    /// malformed query degrades to an empty query rather than crashing the fuzzer.
+    #[test]
+    fn highlight_query_returns_for_every_variant() {
+        for language in Language::ALL {
+            let query = language.ts_highlight_query();
+            let _ = query.pattern_count();
+        }
+        assert_eq!(
+            Language::ALL.len(),
+            13,
+            "Language::ALL must list every variant"
+        );
+        for (index, language) in Language::ALL.into_iter().enumerate() {
+            assert_eq!(
+                language as usize, index,
+                "Language::ALL is out of repr order"
+            );
+        }
+    }
+
     /// Scala source parsed with the wrong grammar must not silently look like
     /// valid Scala: the parse trees differ and the mismatched parse errors.
     #[test]
