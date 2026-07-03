@@ -53,7 +53,9 @@ public final class CoverageAgent {
             }
             try {
                 ClassReader reader = new ClassReader(classfileBuffer);
-                ClassWriter writer = new ClassWriter(reader, ClassWriter.COMPUTE_MAXS);
+                // COMPUTE_FRAMES: inserting hits at block leaders shifts offsets and can invalidate
+                // the original StackMapTable, which the JDK 25 verifier rejects; recompute frames.
+                ClassWriter writer = new ClassWriter(reader, ClassWriter.COMPUTE_FRAMES);
                 reader.accept(new CovClassVisitor(writer, className), 0);
                 return writer.toByteArray();
             } catch (Throwable t) {
@@ -78,13 +80,30 @@ public final class CoverageAgent {
             if (mv == null) {
                 return null;
             }
-            int id = stableId(className + "#" + name + descriptor);
+            String method = className + "#" + name + descriptor;
             return new MethodVisitor(Opcodes.ASM9, mv) {
+                // Deterministic basic-block ordinal within this method. Combined with the method
+                // key it yields stable per-block ids across JVM launches (task4 doc), so the
+                // inserted `Cov.hit` sequence — LDC + INVOKESTATIC (I)V, stack-neutral — never
+                // needs recomputed frames.
+                private int blockOrdinal = 0;
+
+                private void emitHit() {
+                    visitLdcInsn(stableId(method + "@" + blockOrdinal));
+                    visitMethodInsn(Opcodes.INVOKESTATIC, "cov/Cov", "hit", "(I)V", false);
+                    blockOrdinal++;
+                }
+
                 @Override
                 public void visitCode() {
                     super.visitCode();
-                    visitLdcInsn(id);
-                    visitMethodInsn(Opcodes.INVOKESTATIC, "cov/Cov", "hit", "(I)V", false);
+                    emitHit(); // method entry block
+                }
+
+                @Override
+                public void visitLabel(org.objectweb.asm.Label label) {
+                    super.visitLabel(label);
+                    emitHit(); // block leader (branch/jump target, loop head, handler entry)
                 }
             };
         }

@@ -8,9 +8,6 @@ import java.util.Arrays;
 /**
  * Runtime coverage map for the ASM instrumentation agent. AFL-shaped: a fixed-size table of 8-bit
  * saturating counters indexed by an edge hash {@code (prev ^ cur)}. See docs/jvm-coverage-agent.md.
- *
- * <p>This first-slice fixture writes the map to {@code $COV_MAP_PATH} on JVM shutdown; the eventual
- * executor (task7/8) will instead read it from a shared mmap segment per iteration.
  */
 public final class Cov {
     public static final int MAP_SIZE = 1 << 16;
@@ -19,10 +16,17 @@ public final class Cov {
 
     private Cov() {}
 
-    /** Record a transition into block {@code id}. Racy by design, exactly like AFL. */
+    /**
+     * Record a transition into block {@code id}. Racy by design, exactly like AFL. Counters
+     * <b>saturate</b> at 0xff — a hot edge must never wrap back to 0 (that would drop coverage and
+     * corrupt the identical-input stability gate).
+     */
     public static void hit(int id) {
         int edge = (prev ^ id) & (MAP_SIZE - 1);
-        MAP[edge] = (byte) (MAP[edge] + 1);
+        int value = MAP[edge] & 0xff;
+        if (value != 0xff) {
+            MAP[edge] = (byte) (value + 1);
+        }
         prev = id >>> 1;
     }
 
@@ -31,6 +35,18 @@ public final class Cov {
         prev = 0;
     }
 
+    /** Number of edges with a non-zero counter (for bounded-fill / collision diagnostics). */
+    public static int nonZeroEdges() {
+        int n = 0;
+        for (byte b : MAP) {
+            if (b != 0) {
+                n++;
+            }
+        }
+        return n;
+    }
+
+    /** Dump the current map to {@code $COV_MAP_PATH} (cold-replay provenance). */
     public static void dump() {
         String path = System.getenv("COV_MAP_PATH");
         if (path == null) {
