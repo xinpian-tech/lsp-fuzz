@@ -31,6 +31,10 @@ public final class CoverageAgent {
     };
     // Fixed, versioned seed so block ids are stable across JVM launches.
     private static final long SEED = 1125899906842597L;
+    // Collision-free class ids for covered-class tracking. Unlike the 16-bit edge hash, these are
+    // dense unique integers so two classes can never overwrite each other's name in the reach map.
+    private static final java.util.concurrent.atomic.AtomicInteger CLASS_SEQ =
+            new java.util.concurrent.atomic.AtomicInteger();
 
     private CoverageAgent() {}
 
@@ -68,7 +72,7 @@ public final class CoverageAgent {
                 return null;
             }
             try {
-                int classId = stableId(className);
+                int classId = CLASS_SEQ.getAndIncrement();
                 Cov.registerClass(classId, className.replace('/', '.'));
                 ClassReader reader = new ClassReader(classfileBuffer);
                 // COMPUTE_FRAMES: inserting probes at block leaders shifts offsets and invalidates

@@ -6,7 +6,9 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.Callable;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -38,6 +40,7 @@ public final class Harness {
     public static void main(String[] args) throws Exception {
         Harness h = new Harness();
         h.saturationGate();
+        h.classReachOracleGate();
         WorkerHandle w = new WorkerHandle();
         try {
             h.coverageGates(w);
@@ -71,6 +74,44 @@ public final class Harness {
             ok("counter saturates at 0xff after 300 hits");
         } else {
             fail("counter did not saturate (edge 0 = " + v + " after 300 hits)");
+        }
+        Cov.reset();
+    }
+
+    /**
+     * Covered-class tracking must be collision-free: two classes whose 16-bit edge-hash id
+     * collides must still be reported by name. Uses unique sequential ids (as the agent does), so
+     * the edge-hash collision cannot misattribute package reach.
+     */
+    private void classReachOracleGate() {
+        // Brute-force a pair of distinct names that share the same 16-bit edge-hash id.
+        String a = null;
+        String b = null;
+        Map<Integer, String> seen = new HashMap<>();
+        for (int i = 0; a == null && i < 1_000_000; i++) {
+            String name = "pkg.C" + i;
+            int id = CoverageAgent.stableId(name);
+            String prev = seen.putIfAbsent(id, name);
+            if (prev != null) {
+                a = prev;
+                b = name;
+            }
+        }
+        if (a == null || CoverageAgent.stableId(a) != CoverageAgent.stableId(b)) {
+            fail("class-reach oracle test could not construct a colliding pair");
+            return;
+        }
+        Cov.reset();
+        Cov.registerClass(0, a); // unique sequential ids, unlike the 16-bit edge hash
+        Cov.registerClass(1, b);
+        Cov.cls(0);
+        Cov.cls(1);
+        List<String> names = Cov.coveredClassNames();
+        if (names.contains(a) && names.contains(b)) {
+            ok("class-reach oracle is collision-free (edge-hash-colliding " + a + "/" + b
+                    + " both reported)");
+        } else {
+            fail("class-reach oracle dropped a colliding class: " + names);
         }
         Cov.reset();
     }

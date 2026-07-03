@@ -96,6 +96,15 @@ filter widened to `ls/` + `dotty/tools/` + `scala/meta/`):
   uses a fresh epoch per measurement.
 - **Thread-safety**: counter increments are racy on purpose (AFL semantics); the covered-class set
   is a `ConcurrentHashMap.newKeySet()` because the compiler/BSP background threads touch it.
+- **Whole-LS determinism**: a raw whole-LS run is only *near*-deterministic across epochs — the LS
+  is multi-threaded, so background scheduling perturbs a handful of edges (observed delta 0–2 of
+  ~931). The covered-class *set* is identical across epochs. Byte-identical per-input maps are a
+  guarantee of the persistent worker (reset + quiesce per input; see the fixture harness's
+  1000-identical-input gate), not of raw multi-threaded LS runs. The real-LS control gate therefore
+  checks an identical class set + edge counts within a small tolerance, not byte identity.
+- **Covered-class reach oracle**: class ids for reach tracking are dense unique integers (not the
+  16-bit edge hash), so two classes whose edges collide are still reported by name (regression test
+  in the fixture harness).
 
 ### Finding: the presentation compiler is gated on BSP
 
