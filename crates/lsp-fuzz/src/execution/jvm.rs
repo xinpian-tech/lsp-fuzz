@@ -19,8 +19,8 @@
 use std::{
     io::{self, Read, Write},
     path::{Path, PathBuf},
-    process::{Child, ChildStdin, Command, Stdio},
-    sync::mpsc::{Receiver, RecvTimeoutError, channel},
+    process::{Child, Command, Stdio},
+    sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel},
     thread::JoinHandle,
     time::Duration,
 };
@@ -372,6 +372,24 @@ impl<T: WorkerTransport + std::fmt::Debug> JvmWorker<T> {
         }
     }
 
+    /// Run one input and capture its coverage into `map`. This is the executor's per-iteration
+    /// core: the map is filled with the copied coverage **only** when the outcome is
+    /// `coverage_attributable`; otherwise (timeout, late write, snapshot race, fatal, protocol
+    /// error) it is zeroed, so discarded coverage is never surfaced to feedback and a straggler
+    /// write is never credited to this input. Returns the lifecycle outcome; the caller restarts the
+    /// epoch when `restart_required`.
+    pub fn run_capturing(&mut self, input: &[u8], map: &mut [u8; MAP_SIZE]) -> LifecycleOutcome {
+        let outcome = self.run(input);
+        if outcome.coverage_attributable
+            && let Ok(copied) = self.copy_map()
+        {
+            map.copy_from_slice(&copied[..]);
+        } else {
+            map.fill(0);
+        }
+        outcome
+    }
+
     /// Request a worker health snapshot (used heap / live threads / open fds) for leak and
     /// bounded-resource monitoring.
     ///
@@ -408,15 +426,19 @@ impl<T: WorkerTransport + std::fmt::Debug> JvmWorker<T> {
 
 /// A transport backed by a real worker subprocess speaking the control protocol over stdin/stdout.
 ///
-/// A persistent reader thread owns the child's stdout and pushes each complete length-prefixed
-/// reply frame onto a channel, so [`WorkerTransport::request`] can bound its wait with the deadline
-/// (`recv_timeout`) instead of blocking forever on a hung worker. On a deadline miss the caller
-/// restarts the epoch, which [`WorkerTransport::kill`] performs.
+/// Both directions are offloaded to dedicated threads so [`WorkerTransport::request`] itself never
+/// blocks on the pipe: a **writer thread** owns stdin and drains a request channel, and a **reader
+/// thread** owns stdout and pushes each complete length-prefixed reply frame onto a reply channel.
+/// `request` only does a non-blocking channel send plus a `recv_timeout`, so the deadline bounds the
+/// whole exchange — even a worker that never drains stdin (a request larger than the pipe buffer)
+/// cannot stall the caller. On a deadline miss the caller restarts the epoch via
+/// [`WorkerTransport::kill`], which kills the child (unblocking the writer) and joins both threads.
 #[derive(Debug)]
 pub struct SubprocessTransport {
     child: Child,
-    stdin: Option<ChildStdin>,
+    to_writer: Option<Sender<Vec<u8>>>,
     replies: Receiver<io::Result<Vec<u8>>>,
+    writer: Option<JoinHandle<()>>,
     reader: Option<JoinHandle<()>>,
 }
 
@@ -432,34 +454,49 @@ impl SubprocessTransport {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .spawn()?;
-        let stdin = child.stdin.take().ok_or(WorkerError::Protocol)?;
+        let mut stdin = child.stdin.take().ok_or(WorkerError::Protocol)?;
         let mut stdout = child.stdout.take().ok_or(WorkerError::Protocol)?;
-        let (tx, rx) = channel();
-        // The reader loop reads one framed reply at a time and forwards it. When the child dies or
+
+        // Writer thread: drains the request channel and writes to stdin. If the worker never reads
+        // stdin, `write_all` blocks HERE (not in `request`); killing the child closes the pipe and
+        // ends this thread. Exits when the request channel's sender is dropped (`kill`).
+        let (to_writer, from_main) = channel::<Vec<u8>>();
+        let writer = std::thread::spawn(move || {
+            while let Ok(bytes) = from_main.recv() {
+                if stdin.write_all(&bytes).is_err() || stdin.flush().is_err() {
+                    return;
+                }
+            }
+        });
+
+        // Reader thread: reads one framed reply at a time and forwards it. When the child dies or
         // stdout closes, `read_exact` errors and the loop forwards that error then exits; a hung
-        // child simply never sends, and the caller's `recv_timeout` fires instead.
+        // worker simply never sends, and the caller's `recv_timeout` fires instead.
+        let (to_main, replies) = channel();
         let reader = std::thread::spawn(move || {
             loop {
                 let mut len_buf = [0u8; 4];
                 if let Err(err) = stdout.read_exact(&mut len_buf) {
-                    let _ = tx.send(Err(err));
+                    let _ = to_main.send(Err(err));
                     return;
                 }
                 let len = u32::from_le_bytes(len_buf) as usize;
                 let mut reply = vec![0u8; len];
                 if let Err(err) = stdout.read_exact(&mut reply) {
-                    let _ = tx.send(Err(err));
+                    let _ = to_main.send(Err(err));
                     return;
                 }
-                if tx.send(Ok(reply)).is_err() {
+                if to_main.send(Ok(reply)).is_err() {
                     return; // receiver dropped: transport gone
                 }
             }
         });
+
         Ok(SubprocessTransport {
             child,
-            stdin: Some(stdin),
-            replies: rx,
+            to_writer: Some(to_writer),
+            replies,
+            writer: Some(writer),
             reader: Some(reader),
         })
     }
@@ -471,11 +508,13 @@ impl WorkerTransport for SubprocessTransport {
         // so this request's reply is the one recv'd below. After a timeout the caller restarts the
         // epoch anyway, so this is belt-and-suspenders.
         while self.replies.try_recv().is_ok() {}
-        {
-            let stdin = self.stdin.as_mut().ok_or(WorkerError::Protocol)?;
-            stdin.write_all(&request.encode())?;
-            stdin.flush()?;
-        }
+        // Non-blocking hand-off to the writer thread: this never blocks on the pipe, so the deadline
+        // below bounds the whole exchange regardless of a non-draining worker.
+        self.to_writer
+            .as_ref()
+            .ok_or(WorkerError::Protocol)?
+            .send(request.encode())
+            .map_err(|_| WorkerError::Protocol)?;
         if matches!(request, Request::Quit) {
             return Ok(Vec::new());
         }
@@ -488,10 +527,14 @@ impl WorkerTransport for SubprocessTransport {
     }
 
     fn kill(&mut self) {
-        // Dropping stdin signals EOF; killing + waiting reaps the child, which ends the reader.
-        self.stdin = None;
+        // Drop the request sender so the writer's `recv` ends; kill+wait the child so a writer
+        // blocked in `write_all` (non-draining worker) unblocks and the reader hits EOF; then join.
+        self.to_writer = None;
         let _ = self.child.kill();
         let _ = self.child.wait();
+        if let Some(writer) = self.writer.take() {
+            let _ = writer.join();
+        }
         if let Some(reader) = self.reader.take() {
             let _ = reader.join();
         }
@@ -764,11 +807,13 @@ mod tests {
         assert_eq!(worker.status().unwrap(), health);
     }
 
-    /// The real subprocess transport must honor the deadline: a worker that accepts the request and
-    /// never replies yields `WorkerError::Timeout` within the deadline, and `kill()` terminates it
-    /// without hanging. `sleep` ignores stdin and never writes stdout, standing in for a hung worker.
+    /// The real subprocess transport must honor the deadline on BOTH directions: a worker that never
+    /// drains stdin AND a request larger than the OS pipe buffer must still time out within the
+    /// deadline (the write happens on the writer thread, not in `request`), and `kill()` must
+    /// terminate the child + join both threads without hanging. `sleep` ignores stdin and never
+    /// writes stdout, standing in for a hung, non-draining worker.
     #[test]
-    fn subprocess_transport_deadline_times_out_and_kills() {
+    fn subprocess_transport_deadline_bounds_write_and_read() {
         use std::time::Instant;
         let mut command = Command::new("sleep");
         command.arg("100");
@@ -776,17 +821,68 @@ mod tests {
         let Ok(mut transport) = SubprocessTransport::spawn(command) else {
             return;
         };
+        // A 1 MiB payload far exceeds the ~64 KiB pipe buffer; against a non-draining worker the
+        // write cannot complete, but `request` must still return Timeout at the deadline.
+        let big = Request::Run(vec![0x5a; 1 << 20]);
         let start = Instant::now();
-        let result = transport.request(&Request::Run(vec![1, 2, 3]), Duration::from_millis(50));
+        let result = transport.request(&big, Duration::from_millis(50));
         assert!(
             matches!(result, Err(WorkerError::Timeout)),
-            "hung worker must time out, got {result:?}"
+            "hung non-draining worker must time out, got {result:?}"
         );
         assert!(
             start.elapsed() < Duration::from_secs(10),
-            "request should return promptly at the deadline"
+            "request should return promptly at the deadline, not block on the write"
         );
-        // Must terminate the child and join the reader thread without hanging.
+        // Must terminate the child and join both I/O threads without hanging.
         transport.kill();
+    }
+
+    #[test]
+    fn run_capturing_fills_on_attributable_and_zeroes_otherwise() {
+        use std::io::Write as _;
+        // A real map file full of 0x7 for the attributable copy.
+        let mut map_file = tempfile::NamedTempFile::new().unwrap();
+        map_file.write_all(&vec![7u8; MAP_SIZE]).unwrap();
+        map_file.flush().unwrap();
+        let ok = RunResult {
+            status: WorkerStatus::OkSnapshot,
+            iteration_id: 1,
+            nonzero_edges: u32::try_from(MAP_SIZE).unwrap(),
+            covered_classes: vec![],
+        }
+        .encode();
+        let late = RunResult {
+            status: WorkerStatus::LateCoverage,
+            iteration_id: 2,
+            nonzero_edges: 3,
+            covered_classes: vec![],
+        }
+        .encode();
+        let mut worker = JvmWorker::new(
+            MockTransport::new(vec![Ok(ok), Ok(late)]),
+            map_file.path(),
+            Duration::from_secs(1),
+        );
+        // Heap-allocate the buffer without a large stack array.
+        let mut buf: Box<[u8; MAP_SIZE]> =
+            vec![0u8; MAP_SIZE].into_boxed_slice().try_into().unwrap();
+
+        // Attributable → buffer holds the copied map.
+        let out = worker.run_capturing(b"a", &mut buf);
+        assert!(out.coverage_attributable);
+        assert!(
+            buf.iter().all(|&b| b == 7),
+            "attributable map must be copied"
+        );
+
+        // Late coverage → buffer zeroed, restart required, coverage discarded.
+        let out = worker.run_capturing(b"b", &mut buf);
+        assert!(!out.coverage_attributable);
+        assert!(out.restart_required);
+        assert!(
+            buf.iter().all(|&b| b == 0),
+            "discarded coverage must be zeroed, not left stale"
+        );
     }
 }
