@@ -37,6 +37,26 @@ flags=(-javaagent:"$agent" -XX:-UseCompactObjectHeaders -Xshare:off -XX:+UseSeri
 java="$JAVA_HOME/bin/java"
 edges() { cmp -l "$1" zero.bin 2>/dev/null | wc -l; }
 
+# Percent-encode a filesystem path into a file:// URI (keeps '/', encodes spaces etc.).
+path_to_file_uri() { printf 'file://%s' "$(jq -Rr 'split("/")|map(@uri)|join("/")' <<<"$1")"; }
+
+# Poll a log file for a pattern up to <timeout> seconds; return 0 if seen.
+wait_log() {
+  local file="$1" pat="$2" timeout="$3" i=0
+  while [ "$i" -lt "$timeout" ]; do
+    [ -f "$file" ] && grep -qE "$pat" "$file" && return 0
+    sleep 1; i=$((i + 1))
+  done
+  return 1
+}
+
+# A positive-epoch log is unhealthy if BSP never started or the LS reported a readiness/command error.
+log_unhealthy() {
+  local f="$1"
+  ! grep -q 'BSP server started' "$f" \
+    || grep -qE 'compile unavailable|workspace is not ready|"error":\{|Invalid.*json|Unrecognized' "$f"
+}
+
 # send_obj builds one JSON-RPC object with jq (proper encoding), validates it, and frames it on fd 3.
 send_obj() {
   local json
@@ -56,13 +76,17 @@ run_epoch() {
   if [ -z "$wsRoot" ]; then
     send_obj --argjson id 1 '{jsonrpc:"2.0",id:$id,method:"initialize",params:{processId:null,rootUri:null,capabilities:{}}}'
   else
-    send_obj --argjson id 1 --arg root "file://$wsRoot" '{jsonrpc:"2.0",id:$id,method:"initialize",params:{processId:null,rootUri:$root,workspaceFolders:[{uri:$root,name:"ws"}],capabilities:{}}}'
+    send_obj --argjson id 1 --arg root "$(path_to_file_uri "$wsRoot")" '{jsonrpc:"2.0",id:$id,method:"initialize",params:{processId:null,rootUri:$root,workspaceFolders:[{uri:$root,name:"ws"}],capabilities:{}}}'
   fi
   send_obj '{jsonrpc:"2.0",method:"initialized",params:{}}'
   send_obj --arg uri "$docUri" --arg text "$docText" '{jsonrpc:"2.0",method:"textDocument/didOpen",params:{textDocument:{uri:$uri,languageId:"scala",version:1,text:$text}}}'
   if [ "$driveCompile" = 1 ]; then
+    # Wait for the LS to finish its post-initialized bootstrap (BSP connect + build-target import)
+    # before driving a compile, else the server answers "workspace is not ready".
+    wait_log "$here/ls-out-$n.log" 'bootstrap finished: ready' "${LS_BSP_READY_TIMEOUT:-200}" || true
     send_obj --argjson id 10 '{jsonrpc:"2.0",id:$id,method:"workspace/executeCommand",params:{command:"scala3SemanticLs.compile",arguments:[]}}'
-    sleep "${LS_COMPILE_SLEEP:-90}" # let BSP compile + classpath resolve so the PC can answer
+    wait_log "$here/ls-out-$n.log" '"id":10' "${LS_COMPILE_SLEEP:-120}" || true
+    sleep 5 # settle after the compile response before completing
   fi
   send_obj --argjson id 2 --arg uri "$docUri" '{jsonrpc:"2.0",id:$id,method:"textDocument/completion",params:{textDocument:{uri:$uri},position:{line:2,character:11}}}'
   sleep "${LS_SESSION_SLEEP:-30}"
@@ -98,24 +122,25 @@ fi
 # --- Positive gate (BSP-backed) ---
 if [ -n "${LS_BSP_WORKSPACE:-}" ]; then
   ws="$(cd "$LS_BSP_WORKSPACE" && pwd)"
-  doc="file://$ws/app/src/Foo.scala"
+  doc="$(path_to_file_uri "$ws/app/src/Foo.scala")"
   pos_text=$'object Foo:\n  def greet(name: String): String = "hi " + name\n  val z = gre\n'
   run_epoch 3 "$ws" "$ws" "$doc" "$pos_text" 1
   run_epoch 4 "$ws" "$ws" "$doc" "$pos_text" 1
-  bsp_ok=$(grep -c 'BSP server started' ls-out-3.log || true)
-  jsonerr=$(grep -icE 'invalid.*json|jsonrpc.*(parse|invalid)|Unrecognized|MalformedJson' ls-out-3.log || true)
   e3=$(edges ls-map-3.bin); e4=$(edges ls-map-4.bin); pdelta=$(( e3 > e4 ? e3 - e4 : e4 - e3 ))
   c3=$(grep -cE '^(dotty\.tools\.|scala\.meta\.)' ls-classes-3.txt 2>/dev/null || true)
   c4=$(grep -cE '^(dotty\.tools\.|scala\.meta\.)' ls-classes-4.txt 2>/dev/null || true)
   cmp -s ls-classes-3.txt ls-classes-4.txt && pset=identical || pset=DIFFERED
-  # The compiler path runs many background/JIT threads, so raw edge counts vary more than the
-  # no-BSP control; the deterministic signal is the identical covered-class set. Allow ~10% edge
-  # drift (pdelta*10 <= e3) and require large non-empty maps + compiler-class reach in both epochs.
+  healthy=1
+  log_unhealthy ls-out-3.log && healthy=0
+  log_unhealthy ls-out-4.log && healthy=0
+  # Require: compiler-class reach in both epochs, non-empty maps, identical covered-class set,
+  # edge delta <= 32 (same bound as the control), and both epoch logs healthy (BSP up, a successful
+  # compile with no "compile unavailable"/error responses).
   if [ "${c3:-0}" -gt 0 ] && [ "${c4:-0}" -gt 0 ] && [ "$e3" -gt 0 ] && [ "$e4" -gt 0 ] \
-     && [ "$pset" = identical ] && [ $((pdelta * 10)) -le "$e3" ] && [ "$bsp_ok" -gt 0 ] && [ "$jsonerr" -eq 0 ]; then
-    echo "OK (positive): BSP-backed run reaches compiler/scalameta ($c3/$c4 classes; edges $e3/$e4 delta $pdelta ~$(( pdelta * 100 / e3 ))%; class set $pset)"
+     && [ "$pset" = identical ] && [ "$pdelta" -le 32 ] && [ "$healthy" -eq 1 ]; then
+    echo "OK (positive): BSP-backed run reaches compiler/scalameta ($c3/$c4 classes; edges $e3/$e4 delta $pdelta; class set $pset; compile-readiness OK)"
   else
-    echo "FAIL (positive): BSP=$bsp_ok jsonerr=$jsonerr compiler=$c3/$c4 edges=$e3/$e4 delta=$pdelta set=$pset — compiler reach not yet proven"; fail=1
+    echo "FAIL (positive): compiler=$c3/$c4 edges=$e3/$e4 delta=$pdelta set=$pset healthy=$healthy — see ls-out-3/4.log"; fail=1
   fi
 else
   echo "SKIP (positive): set LS_BSP_WORKSPACE (prepared with setup-bsp-workspace.sh) to require dotty.tools/scala.meta coverage"

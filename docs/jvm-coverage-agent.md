@@ -128,10 +128,17 @@ an identical covered-class set across two epochs, and only small edge drift (~0%
 ASM agent's transformation succeeds on the Scala 3 compiler classes under JDK 25 (they load and are
 instrumented), satisfying the presentation-compiler-reach goal (AC-2/AC-7 positive).
 
-Notes: the compiler path is more multi-threaded than the no-BSP control, so the positive gate
-allows ~10% edge drift while requiring an identical covered-class set. `textDocument/completion`
-may still return an empty item list depending on compile/workspace-init timing, but the PC does run
-(hence the `dotty.tools.pc` coverage), which is what the reach goal requires.
+The positive gate waits for the LS log line `bootstrap finished: ready` (BSP connected + build
+targets imported) before driving `workspace/executeCommand scala3SemanticLs.compile`, and it fails
+if either epoch logs `compile unavailable` / `workspace is not ready` / a JSON-RPC error. With the
+minimal Mill workspace the compile command returns cleanly (`compile skipped: no indexable targets`
+— the target has no SemanticDB), and the run reaches 43 `dotty.tools.pc.*` classes with edge delta
+0 across epochs. `textDocument/completion` may still return an empty item list, but the PC runs
+(hence the coverage), which is what the reach goal requires.
+
+Régime-2 index features (`workspace/symbol`, `references`, `rename`) stay disabled here because the
+minimal target has no SemanticDB output (the LS logs `has no SemanticDB output; ... disabled`);
+proving those paths needs the pinned zaozi SemanticDB backdrop.
 
 ## Next
 - Build the Rust-side JVM executor/observer/feedback that speaks the worker control protocol
