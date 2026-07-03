@@ -546,6 +546,13 @@ impl WorkerTransport for SubprocessTransport {
     }
 }
 
+impl Drop for SubprocessTransport {
+    fn drop(&mut self) {
+        // Reap the worker process and I/O threads if the caller did not restart the epoch.
+        self.kill();
+    }
+}
+
 /// Read exactly [`MAP_SIZE`] bytes from `path` as a coverage map. Standalone helper used by
 /// cold-replay tooling that does not hold a live [`JvmWorker`]. Returns a boxed array so the
 /// `2^16`-byte map is never placed on the stack.
@@ -921,5 +928,61 @@ mod tests {
             buf.iter().all(|&b| b == 0),
             "the observer buffer must be zeroed, not left with prior contents"
         );
+    }
+
+    /// End-to-end cross-language check: compile the real Java worker (no coverage agent needed for a
+    /// protocol round trip) and drive it through the real subprocess transport. Proves the Rust
+    /// codecs interoperate with the Java worker's little-endian framing. Skips if the JDK is absent.
+    #[test]
+    fn real_java_worker_round_trip() {
+        let agent = concat!(env!("CARGO_MANIFEST_DIR"), "/../../jvm-coverage-agent/src");
+        let sources = [
+            format!("{agent}/cov/Cov.java"),
+            format!("{agent}/cov/Worker.java"),
+            format!("{agent}/fixture/Target.java"),
+        ];
+        if !sources.iter().all(|s| std::path::Path::new(s).exists()) {
+            return; // sources not laid out as expected: skip
+        }
+        let out = tempfile::tempdir().unwrap();
+        let compiled = Command::new("javac")
+            .arg("-d")
+            .arg(out.path())
+            .args(&sources)
+            .status();
+        match compiled {
+            Ok(status) if status.success() => {}
+            _ => return, // javac unavailable or failed to compile: skip
+        }
+        let map_file = out.path().join("map.bin");
+        let mut command = Command::new("java");
+        command
+            .arg("-cp")
+            .arg(out.path())
+            .arg("cov.Worker")
+            .env("COV_MAP_PATH", &map_file);
+        let Ok(transport) = SubprocessTransport::spawn(command) else {
+            return;
+        };
+        let mut worker = JvmWorker::new(transport, &map_file, Duration::from_secs(30));
+
+        // A normal (non-0xEE / non-0xFF) input runs cleanly -> OkSnapshot -> attributable.
+        let outcome = worker.run(&[0x01]);
+        assert!(
+            outcome.coverage_attributable,
+            "normal input should be a clean snapshot, got {outcome:?}"
+        );
+        let map = worker
+            .copy_map()
+            .expect("worker must publish a MAP_SIZE map");
+        assert_eq!(map.len(), MAP_SIZE);
+
+        // Status round trip decodes a well-formed WorkerHealth.
+        let health = worker.status().expect("status reply must decode");
+        assert!(
+            health.threads >= 1,
+            "worker reports at least its own thread"
+        );
+        // Dropping the worker/transport reaps the child.
     }
 }

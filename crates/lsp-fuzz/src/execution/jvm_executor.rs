@@ -18,7 +18,7 @@ use libafl::{
 };
 use libafl_bolts::{AsSliceMut, tuples::RefIndexable};
 
-use super::jvm::{JvmWorker, MAP_SIZE, WorkerTransport};
+use super::jvm::{JvmWorker, MAP_SIZE, WorkerError, WorkerTransport};
 
 /// The coverage observer for JVM targets: an owned AFL edge map the executor fills from the copied
 /// worker snapshot each iteration. Reuses `LibAFL`'s map observer so it composes with the standard
@@ -37,7 +37,7 @@ where
     T: WorkerTransport + fmt::Debug,
 {
     worker: JvmWorker<T>,
-    respawn: Box<dyn FnMut() -> T>,
+    respawn: Box<dyn FnMut() -> Result<T, WorkerError>>,
     observers: (JvmCoverageObserver, ()),
     _phantom: PhantomData<(I, S)>,
 }
@@ -57,8 +57,13 @@ impl<T, I, S> JvmLspExecutor<T, I, S>
 where
     T: WorkerTransport + fmt::Debug,
 {
-    /// Create an executor over `worker`; `respawn` produces a fresh transport for epoch restarts.
-    pub fn new(worker: JvmWorker<T>, respawn: impl FnMut() -> T + 'static) -> Self {
+    /// Create an executor over `worker`; `respawn` spawns a fresh transport for epoch restarts and
+    /// may fail (e.g. the JVM cannot be re-launched), in which case `run_target` reports an error
+    /// rather than continuing on a dead epoch.
+    pub fn new(
+        worker: JvmWorker<T>,
+        respawn: impl FnMut() -> Result<T, WorkerError> + 'static,
+    ) -> Self {
         JvmLspExecutor {
             worker,
             respawn: Box::new(respawn),
@@ -71,6 +76,16 @@ where
     #[must_use]
     pub fn coverage_observer(&self) -> &JvmCoverageObserver {
         &self.observers.0
+    }
+
+    /// Restart the worker epoch when the last run tainted it. Propagates a spawn failure so the
+    /// caller never continues on a dead epoch.
+    fn restart_if_needed(&mut self, restart_required: bool) -> Result<(), WorkerError> {
+        if restart_required {
+            let fresh = (self.respawn)()?;
+            self.worker.restart_epoch(fresh);
+        }
+        Ok(())
     }
 }
 
@@ -113,10 +128,10 @@ where
                 .expect("jvm coverage observer map is MAP_SIZE");
             self.worker.run_capturing(&bytes, map)
         };
-        if outcome.restart_required {
-            let fresh = (self.respawn)();
-            self.worker.restart_epoch(fresh);
-        }
+        self.restart_if_needed(outcome.restart_required)
+            .map_err(|err| {
+                libafl::Error::unknown(format!("failed to restart JVM worker epoch: {err}"))
+            })?;
         *state.executions_mut() += 1;
         Ok(outcome.exit_kind)
     }
@@ -124,9 +139,27 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use libafl_bolts::AsSlice;
 
     use super::*;
+    use crate::execution::jvm::Request;
+
+    /// Minimal transport for executor tests: every request errors (its replies are irrelevant here;
+    /// the executor's restart path is what these tests exercise).
+    #[derive(Debug)]
+    struct DeadTransport;
+    impl WorkerTransport for DeadTransport {
+        fn request(
+            &mut self,
+            _request: &Request,
+            _deadline: Duration,
+        ) -> Result<Vec<u8>, WorkerError> {
+            Err(WorkerError::Protocol)
+        }
+        fn kill(&mut self) {}
+    }
 
     /// The coverage observer is exactly `MAP_SIZE` bytes and is the buffer `run_target` writes the
     /// copied worker snapshot into; the standard `MaxMapFeedback` reads novelty from it.
@@ -142,5 +175,20 @@ mod tests {
         let map = observer.as_slice();
         assert_eq!(map[0], 1);
         assert_eq!(map[MAP_SIZE - 1], 2);
+    }
+
+    /// A required epoch restart whose respawn fails must surface as an error, not a panic, and not a
+    /// silent continue on a dead epoch.
+    #[test]
+    fn restart_failure_is_reported_not_panicked() {
+        let worker = JvmWorker::new(DeadTransport, "/nonexistent/map", Duration::from_secs(1));
+        let mut executor: JvmLspExecutor<DeadTransport, (), ()> =
+            JvmLspExecutor::new(worker, || Err(WorkerError::Protocol));
+        assert!(
+            executor.restart_if_needed(true).is_err(),
+            "a failed respawn on a required restart must be an error"
+        );
+        // No restart needed → Ok even if respawn would fail.
+        assert!(executor.restart_if_needed(false).is_ok());
     }
 }

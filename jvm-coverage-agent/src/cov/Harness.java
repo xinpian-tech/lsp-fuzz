@@ -1,7 +1,10 @@
 package cov;
 
 import java.io.DataInputStream;
+import java.io.IOException;
 import java.io.OutputStream;
+import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
@@ -272,10 +275,12 @@ public final class Harness {
         final Process process;
         private final OutputStream toWorker;
         private final DataInputStream fromWorker;
+        private final String mapPath;
         private final ExecutorService reader = Executors.newSingleThreadExecutor();
 
         WorkerHandle() throws Exception {
             String java = System.getProperty("java.home") + "/bin/java";
+            this.mapPath = "map-" + System.nanoTime() + ".bin";
             List<String> cmd = new ArrayList<>();
             cmd.add(java);
             cmd.addAll(Arrays.asList(JVM_FLAGS));
@@ -284,7 +289,7 @@ public final class Harness {
             cmd.add("out");
             cmd.add("cov.Worker");
             ProcessBuilder pb = new ProcessBuilder(cmd);
-            pb.environment().put("COV_MAP_PATH", "map-latest.bin");
+            pb.environment().put("COV_MAP_PATH", mapPath);
             pb.redirectError(ProcessBuilder.Redirect.INHERIT);
             this.process = pb.start();
             this.toWorker = process.getOutputStream();
@@ -292,26 +297,42 @@ public final class Harness {
         }
 
         Run run(byte[] input, long timeoutMs) throws Exception {
-            toWorker.write('R');
-            toWorker.write((input.length >>> 24) & 0xff);
-            toWorker.write((input.length >>> 16) & 0xff);
-            toWorker.write((input.length >>> 8) & 0xff);
-            toWorker.write(input.length & 0xff);
+            ByteBuffer header = ByteBuffer.allocate(5).order(ByteOrder.LITTLE_ENDIAN);
+            header.put((byte) 'R');
+            header.putInt(input.length);
+            toWorker.write(header.array());
             toWorker.write(input);
             toWorker.flush();
-            return await(() -> {
-                int outcome = fromWorker.readUnsignedByte();
-                byte[] map = new byte[MAP_SIZE];
-                fromWorker.readFully(map);
-                return new Run(outcome, map);
-            }, timeoutMs);
+            // The reply frame carries only metadata (status/iterationId/edges); the map is published
+            // out of band at $COV_MAP_PATH, so read it from the file after the reply arrives.
+            byte[] body = await(() -> readFrame(fromWorker), timeoutMs);
+            if (body == null) {
+                return null; // hung run: await already killed the process
+            }
+            int status = body[0] & 0xff;
+            int outcome = status == 0 ? 0 : 1; // OkSnapshot -> OK; anything else -> CRASH
+            byte[] map = Files.readAllBytes(Path.of(mapPath));
+            return new Run(outcome, map);
         }
 
         Status status(long timeoutMs) throws Exception {
             toWorker.write('S');
             toWorker.flush();
-            return await(() -> new Status(fromWorker.readLong(), fromWorker.readInt(),
-                    fromWorker.readLong()), timeoutMs);
+            byte[] body = await(() -> readFrame(fromWorker), timeoutMs);
+            if (body == null) {
+                return null;
+            }
+            ByteBuffer b = ByteBuffer.wrap(body).order(ByteOrder.LITTLE_ENDIAN);
+            return new Status(b.getLong(), b.getInt(), b.getLong());
+        }
+
+        private static byte[] readFrame(DataInputStream in) throws IOException {
+            byte[] lenBytes = new byte[4];
+            in.readFully(lenBytes);
+            int len = ByteBuffer.wrap(lenBytes).order(ByteOrder.LITTLE_ENDIAN).getInt();
+            byte[] body = new byte[len];
+            in.readFully(body);
+            return body;
         }
 
         private <T> T await(Callable<T> read, long timeoutMs) throws Exception {
