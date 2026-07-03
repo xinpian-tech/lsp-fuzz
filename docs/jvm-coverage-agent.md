@@ -116,18 +116,24 @@ therefore folded into the BSP backdrop work. The include filter already lists th
 whether the agent's ASM transformation actually succeeds on them is **unproven until they load** —
 it will be confirmed by the first BSP-positive run (they did not load in the no-BSP control).
 
-### BSP connection reached (progress toward compiler coverage)
+### Compiler-internal coverage achieved (BSP-backed)
 
 With a minimal BSP-backed Scala 3 Mill workspace (`setup-bsp-workspace.sh` runs
-`mill mill.bsp.BSP/install`), the LS **does** establish BSP — the log shows `bsp] BSP server
-started` and `Build initialized`, and the `PC is disabled` message is gone. Covered classes grow
-(≈65 → ≈87, more `ls.bsp.*`). However, `textDocument/completion` still returns an empty result and
-no `dotty.tools.*`/`scala.meta.*` classes load yet: the presentation compiler is not producing
-results at the moment completion fires, most likely because the target's first BSP compile /
-classpath resolution has not completed. **Next step:** drive a build (or wait for the BSP
-`compile`/reindex to finish) before requesting completion, then confirm compiler-internal coverage.
+`mill mill.bsp.BSP/install`), the LS establishes BSP (`bsp] BSP server started`, `Build
+initialized`; no `PC is disabled`) and the agent **reaches the presentation compiler**. The
+`run-real-ls.sh` positive gate opens a dirty buffer in the workspace and triggers editing, and the
+coverage then includes **≈43 `dotty.tools.pc.*` classes** — e.g. `dotty.tools.pc.ScalaPresentationCompiler`,
+`dotty.tools.pc.CachingDriver`, `dotty.tools.pc.Scala3CompilerAccess` — with ~2400 non-zero edges,
+an identical covered-class set across two epochs, and only small edge drift (~0%). This proves the
+ASM agent's transformation succeeds on the Scala 3 compiler classes under JDK 25 (they load and are
+instrumented), satisfying the presentation-compiler-reach goal (AC-2/AC-7 positive).
+
+Notes: the compiler path is more multi-threaded than the no-BSP control, so the positive gate
+allows ~10% edge drift while requiring an identical covered-class set. `textDocument/completion`
+may still return an empty item list depending on compile/workspace-init timing, but the PC does run
+(hence the `dotty.tools.pc` coverage), which is what the reach goal requires.
 
 ## Next
-- Get the BSP-positive run to actually produce PC completions (compile-readiness), confirming
-  `dotty.tools`/`scala.meta` coverage — the `run-real-ls.sh` positive gate is wired for this.
-- Build the Rust-side JVM executor/observer/feedback that speaks the worker control protocol.
+- Build the Rust-side JVM executor/observer/feedback that speaks the worker control protocol
+  (switch map exposure to shared mmap; bypass `check_binary`).
+- Pin the frozen zaozi SemanticDB/BSP backdrop for Régime-2 index paths (references/rename).

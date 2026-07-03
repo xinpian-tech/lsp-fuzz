@@ -63,6 +63,7 @@
             jdk25
             mill
             sqlite
+            jq
           ];
           env.JAVA_HOME = "${pkgs.jdk25}";
         };
