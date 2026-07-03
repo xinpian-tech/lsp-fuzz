@@ -52,6 +52,20 @@
           ];
           env.RUST_SRC_PATH = "${pkgs.rustPlatform.rustLibSrc}";
         };
+
+        # Toolchain for the JVM fuzz target (scala3-bsp-smantic-ls): JDK 25 +
+        # Mill + SQLite. The target itself is built from its own flake
+        # (`nix build` in that repo), which pins Mill 1.1.2 and its ivy lock;
+        # this shell provides the runtime + agent-development tools around it.
+        # See docs/jvm-target.md.
+        devShells.jvm = pkgs.mkShell {
+          packages = with pkgs; [
+            jdk25
+            mill
+            sqlite
+          ];
+          env.JAVA_HOME = "${pkgs.jdk25}";
+        };
       }
     );
 }

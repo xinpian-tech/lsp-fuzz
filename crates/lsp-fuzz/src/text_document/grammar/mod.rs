@@ -167,7 +167,9 @@ pub enum CreationError {
 mod tests {
 
     use super::*;
-    use crate::text_document::{TextDocument, grammar::tree_sitter::CapturesIterator};
+    use crate::text_document::{
+        GrammarBasedMutation, TextDocument, grammar::tree_sitter::CapturesIterator,
+    };
 
     #[test]
     fn load_all_derivation_grammars() {
@@ -227,5 +229,66 @@ mod tests {
         let text = &doc.content()[node.byte_range()];
         assert_eq!(text, b"// Hello");
         assert!(capture_iter.next().is_none());
+
+        // `object` is captured as a plain `keyword` by the Scala highlight query.
+        let keywords: Vec<&[u8]> = CapturesIterator::new(&doc, "keyword")
+            .unwrap()
+            .map(|node| &doc.content()[node.byte_range()])
+            .collect();
+        assert!(
+            keywords.contains(&b"object".as_slice()),
+            "expected an `object` keyword capture, got {keywords:?}"
+        );
+    }
+
+    #[test]
+    fn scala_language_metadata() {
+        assert_eq!(Language::Scala.lsp_language_id(), "scala");
+        let exts = Language::Scala.file_extensions();
+        assert!(exts.contains("scala"));
+        assert!(exts.contains("sc"));
+    }
+
+    /// Scala's highlight query must compile against the Scala grammar, and
+    /// `ts_highlight_query()` for Scala must not index out of bounds. Scala is
+    /// the last enum variant, so its `QUERIES` index equals `VARIANT_COUNT - 1`;
+    /// a stale `VARIANT_COUNT` (still 12) would panic on this call.
+    #[test]
+    fn scala_highlight_query_compiles() {
+        let query = Language::Scala.ts_highlight_query();
+        assert!(
+            !query.capture_names().is_empty(),
+            "Scala highlight query should expose captures"
+        );
+    }
+
+    /// Scala source parsed with the wrong grammar must not silently look like
+    /// valid Scala: the parse trees differ and the mismatched parse errors.
+    #[test]
+    fn scala_wrong_grammar_distinct_parse() {
+        const SCALA_CODE: &str = "object Main:\n  val x: Int = 1\n";
+        let scala = TextDocument::new(Language::Scala, SCALA_CODE.as_bytes().to_vec());
+        let as_rust = TextDocument::new(Language::Rust, SCALA_CODE.as_bytes().to_vec());
+
+        let scala_sexp = scala.parse_tree().root_node().to_sexp();
+        let rust_sexp = as_rust.parse_tree().root_node().to_sexp();
+        assert_ne!(
+            scala_sexp, rust_sexp,
+            "different grammars must parse differently"
+        );
+        assert!(
+            !scala.parse_tree().root_node().has_error(),
+            "valid Scala should parse cleanly with the Scala grammar"
+        );
+        assert!(
+            as_rust.parse_tree().root_node().has_error(),
+            "Scala source parsed as Rust should contain error nodes"
+        );
+    }
+
+    #[test]
+    fn malformed_scala_grammar_rejected() {
+        // Malformed grammar JSON must be rejected with an error, not accepted.
+        assert!(Grammar::from_tree_sitter_grammar_json(Language::Scala, "{ not json").is_err());
     }
 }
