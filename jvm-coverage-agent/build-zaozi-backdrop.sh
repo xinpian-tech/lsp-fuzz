@@ -37,7 +37,9 @@ snapshot_hash() {
   local root="$1"
   ( cd "$root" &&
     { find sources -type f -name '*.scala' 2>/dev/null
-      find semanticdb -type f -name '*.semanticdb' 2>/dev/null; } | LC_ALL=C sort |
+      find sources -type f -name 'package.mill' 2>/dev/null
+      find semanticdb -type f -name '*.semanticdb' 2>/dev/null
+      [ -f build.mill ] && echo build.mill; } | LC_ALL=C sort |
       while IFS= read -r f; do printf '%s  %s\n' "$(sha256sum "$f" | cut -d' ' -f1)" "$f"; done
   ) | sha256sum | cut -d' ' -f1
 }
@@ -115,6 +117,9 @@ for m in $BACKDROP_MODULES; do
              -type f -name '*.semanticdb' 2>/dev/null)
 done
 [ "$sdb_count" -gt 0 ] || die "no SemanticDB files were generated for modules: $BACKDROP_MODULES"
+# Freeze the top-level build.mill too, so a throwaway single-module workspace can be materialized
+# entirely from verified artifacts (the Régime-2 reach gate needs it + the module sources).
+cp "$ZAOZI_REPO/build.mill" "$BACKDROP_OUT/build.mill"
 cp "$ZAOZI_REPO/.bsp/mill-bsp.json" "$BACKDROP_OUT/bsp/mill-bsp.json"
 bsp_hash=$(sha256sum "$BACKDROP_OUT/bsp/mill-bsp.json" | cut -d' ' -f1)
 
@@ -132,7 +137,7 @@ jq -n \
     bsp: { file: "bsp/mill-bsp.json", server: $bspn, bspVersion: $bspv, sha256: $bsph },
     classpath: { sha256: $cph },
     semanticdb: { count: $sdb, root: "semanticdb" },
-    snapshot: { root: ".", files: "sources/**.scala + semanticdb/**.semanticdb", sha256: $snap },
+    snapshot: { root: ".", files: "build.mill + sources/**.{scala,package.mill} + semanticdb/**.semanticdb", sha256: $snap },
     version_skew: {
       note: "zaozi compiles with Scala \($scala); the target LS bundles the Scala 3.8.4 presentation compiler.",
       handling: "SemanticDB uses the stable schema-4 format shared across Scala 3.7 and 3.8, so the LS scalameta reader consumes the 3.7.4-produced SemanticDB unchanged. If the LS ever rejects it, recompile the backdrop with BACKDROP scala pinned to 3.8.4."

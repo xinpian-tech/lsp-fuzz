@@ -15,5 +15,6 @@ bsp-*.txt
 bsp-*.log
 r2-classes.txt
 r2-out.log
+r2-resp.log
 .r2-*.log
 zaozi-backdrop/

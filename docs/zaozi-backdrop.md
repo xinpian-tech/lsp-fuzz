@@ -88,30 +88,47 @@ surface.
   intact copy at a different path (the sources+SemanticDB snapshot hash is location-independent,
   while the BSP file is pinned exactly by its own hash).
 
-## Régime-2 index reach (verified)
+## Régime-2 index reach (verified — honest gate)
 
-`jvm-coverage-agent/run-regime2-ls.sh` drives the agent-instrumented LS against this backdrop over a
-live BSP session — `scala3SemanticLs.compile` then `scala3SemanticLs.reindex`, then
-`workspace/symbol` / `textDocument/references` / `textDocument/rename` — and classifies covered-class
-reach. Against zaozi `fefb58e9` it reaches the index paths, not just transport:
+`jvm-coverage-agent/run-regime2-ls.sh` is the Régime-2 gate. It is **provenance-anchored and
+fail-closed**:
 
-- `reindex` ingested **253 docs / 26,572 symbols / 25,152 rename groups** from zaozi's SemanticDB
-  (`IndexUnavailable` targets: 0), and `workspace/symbol` returned real hits (e.g. `instructionSets`
-  in `rvdecoderdb/src/Instruction.scala`).
-- Coverage reached **148 SemanticDB/index/BSP classes** — `scala.meta` (39), `ls.index` (49),
-  `ls.postings` (23), `ls.rename` (16), `ls.bsp` (24), `ls.sqlite` (21) — plus 1158 `dotty.tools.*`
-  (the BSP compile ran the compiler) and 28 `ls.pc.*` facade classes, with **0** `org.eclipse.lsp4j`
-  transport classes. This satisfies AC-7 Régime-2: the frozen backdrop's index paths are not shallow.
+1. verifies the frozen backdrop (`build-zaozi-backdrop.sh VERIFY_ONLY=1`) — provenance mismatch aborts;
+2. materializes a **throwaway single-module live-BSP workspace** from the verified artifacts only
+   (frozen `build.mill` + `sources/<module>`), never mutating any source checkout, and patches only
+   the throwaway copy to enable `-Xsemanticdb`;
+3. runs the agent-instrumented LS on its pinned JDK and drives `scala3SemanticLs.compile` →
+   `scala3SemanticLs.reindex` → `workspace/symbol` → `textDocument/references` →
+   `textDocument/rename` (the last two against the on-disk indexed file — no unsaved buffer, which
+   the LS excludes from global references/rename);
+4. passes only when every hard predicate holds and the index methods genuinely succeed.
 
-Two operational requirements this surfaced:
+Verified run against zaozi `fefb58e9` (module `rvdecoderdb`):
 
-- **Run the LS on its own pinned JDK.** The LS's FFM SQLite binding segfaults (`sqlite3Malloc`) on a
+- Hard predicates: `bootstrap finished: ready`; compile response non-error (single module fits the
+  LS's 30s BSP request timeout); `reindex` non-error ingesting **16 docs**; **0** `IndexUnavailable`
+  targets; `workspace/symbol` returned **19** hits under the workspace; `textDocument/references`
+  returned a non-empty array (**6** locations); `textDocument/rename` returned a non-empty
+  `WorkspaceEdit`. JSON-RPC errors on any method fail the gate.
+- Coverage reached the index paths, not transport: **41 `ls.semanticdb.*`** (the LS's own SemanticDB
+  reader — `ProtoReader`, `SdbDocument`, `FreshnessCheck`, `Md5`, `Normalizer`) and **128** server
+  index classes (`ls.index` 54, `ls.postings` 23, `ls.rename` 32, `ls.sqlite` 19), plus 23 `ls.bsp`
+  and 12 `ls.pc`, with **0** `org.eclipse.lsp4j` transport classes. This satisfies AC-7 Régime-2.
+
+Notes:
+
+- **SemanticDB-reach signal is `ls.semanticdb.*`, not `scala.meta.*`.** This LS parses SemanticDB
+  protobuf with its own reader (`ls.semanticdb.ProtoReader`) and does not load the scalameta library
+  on the index path (`scala.meta` = 0 here), so the gate requires `ls.semanticdb.*` + a server index
+  namespace. (An earlier full-multi-module run showed a few `scala.meta.*` classes incidental to the
+  compiler; they are not the index-path signal.)
+- **Run the LS on its own pinned JDK.** Its FFM SQLite binding segfaults (`sqlite3Malloc`) on a
   foreign `openjdk-25` build; the harness derives the pinned JDK from the LS launcher wrapper. The
   coverage agent itself is fine on the correct JDK.
-- **Live BSP, not a purely static frozen index.** Mill 1.1.2 BSP compiles into `.bsp/out`, so the
-  index fills only after a compile requested over BSP + reindex. Régime-2's DEC-6 mode is therefore
-  "live BSP" (drive compile+reindex), with this frozen backdrop supplying the pinned, tamper-evident
-  corpus + SemanticDB.
+- **Verified frozen corpus + throwaway live-BSP materialization.** Mill 1.1.2 BSP compiles into
+  `.bsp/out`, so the index fills via a compile requested over BSP + reindex (DEC-6 mode = live BSP),
+  not a purely static frozen index. The frozen backdrop supplies the pinned, tamper-evident corpus +
+  SemanticDB; the gate rebuilds/reindexes it live in a throwaway workspace per run.
 
 ## Next
 
