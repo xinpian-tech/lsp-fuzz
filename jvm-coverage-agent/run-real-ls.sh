@@ -57,6 +57,19 @@ log_unhealthy() {
     || grep -qE 'compile unavailable|workspace is not ready|"error":\{|Invalid.*json|Unrecognized' "$f"
 }
 
+# Hard readiness check: the LS logged that its post-initialized bootstrap completed.
+ready_seen() { grep -q 'bootstrap finished: ready' "$1"; }
+
+# Hard compile check: the id:10 JSON-RPC response is present, has no error, and its result is not a
+# readiness/unavailable message (a successful/clean compile response).
+compile_ok() {
+  local obj
+  obj=$(grep -oE '\{"jsonrpc":"2\.0","id":10[^}]*\}' "$1" | head -1)
+  [ -n "$obj" ] || return 1
+  jq -e '(.error | not) and (((.result // "") | tostring) | test("unavailable|not ready|not initialized") | not)' \
+    >/dev/null 2>&1 <<<"$obj"
+}
+
 # send_obj builds one JSON-RPC object with jq (proper encoding), validates it, and frames it on fd 3.
 send_obj() {
   local json
@@ -133,14 +146,20 @@ if [ -n "${LS_BSP_WORKSPACE:-}" ]; then
   healthy=1
   log_unhealthy ls-out-3.log && healthy=0
   log_unhealthy ls-out-4.log && healthy=0
+  # Hard, per-epoch readiness + successful compile response (not just absence of bad strings).
+  ready=1
+  for n in 3 4; do
+    ready_seen "ls-out-$n.log" || ready=0
+    compile_ok "ls-out-$n.log" || ready=0
+  done
   # Require: compiler-class reach in both epochs, non-empty maps, identical covered-class set,
-  # edge delta <= 32 (same bound as the control), and both epoch logs healthy (BSP up, a successful
-  # compile with no "compile unavailable"/error responses).
+  # edge delta <= 32 (same bound as the control), both epoch logs healthy, and both epochs observed
+  # BSP bootstrap-ready + a clean id:10 compile response.
   if [ "${c3:-0}" -gt 0 ] && [ "${c4:-0}" -gt 0 ] && [ "$e3" -gt 0 ] && [ "$e4" -gt 0 ] \
-     && [ "$pset" = identical ] && [ "$pdelta" -le 32 ] && [ "$healthy" -eq 1 ]; then
-    echo "OK (positive): BSP-backed run reaches compiler/scalameta ($c3/$c4 classes; edges $e3/$e4 delta $pdelta; class set $pset; compile-readiness OK)"
+     && [ "$pset" = identical ] && [ "$pdelta" -le 32 ] && [ "$healthy" -eq 1 ] && [ "$ready" -eq 1 ]; then
+    echo "OK (positive): BSP-backed run reaches compiler/scalameta ($c3/$c4 classes; edges $e3/$e4 delta $pdelta; class set $pset; readiness+compile enforced)"
   else
-    echo "FAIL (positive): compiler=$c3/$c4 edges=$e3/$e4 delta=$pdelta set=$pset healthy=$healthy — see ls-out-3/4.log"; fail=1
+    echo "FAIL (positive): compiler=$c3/$c4 edges=$e3/$e4 delta=$pdelta set=$pset healthy=$healthy ready=$ready — see ls-out-3/4.log"; fail=1
   fi
 else
   echo "SKIP (positive): set LS_BSP_WORKSPACE (prepared with setup-bsp-workspace.sh) to require dotty.tools/scala.meta coverage"

@@ -129,12 +129,15 @@ ASM agent's transformation succeeds on the Scala 3 compiler classes under JDK 25
 instrumented), satisfying the presentation-compiler-reach goal (AC-2/AC-7 positive).
 
 The positive gate waits for the LS log line `bootstrap finished: ready` (BSP connected + build
-targets imported) before driving `workspace/executeCommand scala3SemanticLs.compile`, and it fails
-if either epoch logs `compile unavailable` / `workspace is not ready` / a JSON-RPC error. With the
-minimal Mill workspace the compile command returns cleanly (`compile skipped: no indexable targets`
-— the target has no SemanticDB), and the run reaches 43 `dotty.tools.pc.*` classes with edge delta
-0 across epochs. `textDocument/completion` may still return an empty item list, but the PC runs
-(hence the coverage), which is what the reach goal requires.
+targets imported) before driving `workspace/executeCommand scala3SemanticLs.compile`, and it
+**hard-requires, per epoch**, that (a) `bootstrap finished: ready` was observed and (b) the `id:10`
+JSON-RPC compile response is present, has no `.error`, and is not a readiness/"unavailable" message
+(checked with `jq`), in addition to failing on any `compile unavailable`/`workspace is not ready`/
+JSON-RPC error in either log. With the minimal Mill workspace the compile command returns cleanly
+(`compile skipped: no indexable targets` — the target has no SemanticDB), and the run reaches 43
+`dotty.tools.pc.*` classes with a small edge delta across epochs. `textDocument/completion` may
+still return an empty item list, but the PC runs (hence the coverage), which is what the reach goal
+requires.
 
 Régime-2 index features (`workspace/symbol`, `references`, `rename`) stay disabled here because the
 minimal target has no SemanticDB output (the LS logs `has no SemanticDB output; ... disabled`);
