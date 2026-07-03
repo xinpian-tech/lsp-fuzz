@@ -380,13 +380,19 @@ impl<T: WorkerTransport + std::fmt::Debug> JvmWorker<T> {
     /// epoch when `restart_required`.
     pub fn run_capturing(&mut self, input: &[u8], map: &mut [u8; MAP_SIZE]) -> LifecycleOutcome {
         let outcome = self.run(input);
-        if outcome.coverage_attributable
-            && let Ok(copied) = self.copy_map()
-        {
+        if outcome.coverage_attributable {
+            // The worker reported a clean snapshot but if the map is missing / wrong-size /
+            // unreadable the coverage is NOT trustworthy: treat it as a protocol failure — discard
+            // the buffer and require an epoch restart, never surface all-zero coverage as an
+            // attributable run.
+            let Ok(copied) = self.copy_map() else {
+                map.fill(0);
+                return decide(WorkerStatus::ProtocolError);
+            };
             map.copy_from_slice(&copied[..]);
-        } else {
-            map.fill(0);
+            return outcome;
         }
+        map.fill(0);
         outcome
     }
 
@@ -415,11 +421,10 @@ impl<T: WorkerTransport + std::fmt::Debug> JvmWorker<T> {
         read_map(&self.map_path)
     }
 
-    /// Kill and re-spawn the worker epoch. The transport handles process teardown; `respawn`
-    /// installs the fresh transport.
-    pub fn restart_epoch(&mut self, respawn: impl FnOnce() -> T) {
+    /// Kill the current worker and adopt a freshly-spawned transport as the next epoch.
+    pub fn restart_epoch(&mut self, new_transport: T) {
         self.transport.kill();
-        self.transport = respawn();
+        self.transport = new_transport;
         self.epoch += 1;
     }
 }
@@ -725,7 +730,7 @@ mod tests {
             Duration::from_secs(1),
         );
         assert_eq!(worker.epoch(), 0);
-        worker.restart_epoch(|| MockTransport::new(vec![]));
+        worker.restart_epoch(MockTransport::new(vec![]));
         assert_eq!(worker.epoch(), 1);
     }
 
@@ -883,6 +888,38 @@ mod tests {
         assert!(
             buf.iter().all(|&b| b == 0),
             "discarded coverage must be zeroed, not left stale"
+        );
+    }
+
+    #[test]
+    fn run_capturing_clean_snapshot_but_copy_fails_is_non_attributable_restart() {
+        // Worker reports a clean snapshot, but the map file does not exist: coverage is untrusted.
+        let ok = RunResult {
+            status: WorkerStatus::OkSnapshot,
+            iteration_id: 1,
+            nonzero_edges: 5,
+            covered_classes: vec![],
+        }
+        .encode();
+        let mut worker = JvmWorker::new(
+            MockTransport::new(vec![Ok(ok)]),
+            "/nonexistent/map/file",
+            Duration::from_secs(1),
+        );
+        let mut buf: Box<[u8; MAP_SIZE]> =
+            vec![9u8; MAP_SIZE].into_boxed_slice().try_into().unwrap();
+        let out = worker.run_capturing(b"a", &mut buf);
+        assert!(
+            !out.coverage_attributable,
+            "a failed map copy must not be reported as attributable"
+        );
+        assert!(
+            out.restart_required,
+            "a failed map copy must require restart"
+        );
+        assert!(
+            buf.iter().all(|&b| b == 0),
+            "the observer buffer must be zeroed, not left with prior contents"
         );
     }
 }
