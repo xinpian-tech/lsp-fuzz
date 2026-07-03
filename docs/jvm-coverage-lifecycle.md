@@ -33,8 +33,14 @@ The executor must ensure:
 
 This applies to both:
 
-- **Regime 1:** presentation compiler only, no BSP.
-- **Regime 2:** live BSP/index paths on a frozen `zaozi` backdrop.
+- **Regime 1:** presentation-compiler paths (dirty-buffer completion/hover/definition/didChange).
+  NOTE: this target gates the presentation compiler on a BSP connection — it logs `PC is disabled`
+  and returns empty completion with no BSP (see `docs/jvm-coverage-agent.md`). So semantic PC
+  fuzzing for THIS LS is BSP-backed too; the no-BSP path is only a negative/control profile
+  (facade-only reach), not a semantic PC régime. The lifecycle below is identical either way; the
+  difference is purely which readiness the epoch warms to before per-iteration runs begin.
+- **Regime 2:** live BSP/index paths (workspace/symbol, references, rename) on a frozen `zaozi`
+  backdrop.
 
 ---
 
@@ -162,7 +168,10 @@ lateWriteDetectedSince(snapshot_generation)
 
 ### 3.2 LS Logical Reset: Regime 1
 
-Regime 1 targets presentation-compiler paths without BSP.
+Regime 1 targets presentation-compiler paths (dirty-buffer completion/hover/definition/didChange).
+Because this LS gates the presentation compiler on BSP, the epoch warms a BSP-backed workspace
+before per-iteration runs (the no-BSP path is a facade-only control, not a semantic PC régime); the
+per-input reset below is the same regardless.
 
 Per input, reset:
 

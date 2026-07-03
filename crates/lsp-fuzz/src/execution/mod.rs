@@ -34,6 +34,7 @@ use tracing::info;
 use crate::{utf8::UTF8Tokens, utils::AflContext};
 
 pub mod fork_server;
+pub mod jvm;
 pub mod responses;
 pub mod sanitizers;
 mod test;
