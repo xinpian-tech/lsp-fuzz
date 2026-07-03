@@ -88,8 +88,33 @@ surface.
   intact copy at a different path (the sources+SemanticDB snapshot hash is location-independent,
   while the BSP file is pinned exactly by its own hash).
 
+## Régime-2 index reach (verified)
+
+`jvm-coverage-agent/run-regime2-ls.sh` drives the agent-instrumented LS against this backdrop over a
+live BSP session — `scala3SemanticLs.compile` then `scala3SemanticLs.reindex`, then
+`workspace/symbol` / `textDocument/references` / `textDocument/rename` — and classifies covered-class
+reach. Against zaozi `fefb58e9` it reaches the index paths, not just transport:
+
+- `reindex` ingested **253 docs / 26,572 symbols / 25,152 rename groups** from zaozi's SemanticDB
+  (`IndexUnavailable` targets: 0), and `workspace/symbol` returned real hits (e.g. `instructionSets`
+  in `rvdecoderdb/src/Instruction.scala`).
+- Coverage reached **148 SemanticDB/index/BSP classes** — `scala.meta` (39), `ls.index` (49),
+  `ls.postings` (23), `ls.rename` (16), `ls.bsp` (24), `ls.sqlite` (21) — plus 1158 `dotty.tools.*`
+  (the BSP compile ran the compiler) and 28 `ls.pc.*` facade classes, with **0** `org.eclipse.lsp4j`
+  transport classes. This satisfies AC-7 Régime-2: the frozen backdrop's index paths are not shallow.
+
+Two operational requirements this surfaced:
+
+- **Run the LS on its own pinned JDK.** The LS's FFM SQLite binding segfaults (`sqlite3Malloc`) on a
+  foreign `openjdk-25` build; the harness derives the pinned JDK from the LS launcher wrapper. The
+  coverage agent itself is fine on the correct JDK.
+- **Live BSP, not a purely static frozen index.** Mill 1.1.2 BSP compiles into `.bsp/out`, so the
+  index fills only after a compile requested over BSP + reindex. Régime-2's DEC-6 mode is therefore
+  "live BSP" (drive compile+reindex), with this frozen backdrop supplying the pinned, tamper-evident
+  corpus + SemanticDB.
+
 ## Next
 
-- Régime-2 reach (plan task16): drive the real LS against this backdrop over BSP and confirm the
-  index features reach SemanticDB/index/BSP classes (not just transport), then wire the
-  frozen/BSP-disabled-after-init mode.
+- Reconcile the DEC-3 determinism flags with the index path for the AC-2 stability gate (the reach
+  measurement uses production-like flags; the compact-object-headers-off interaction with the
+  SQLite FFM path is untested).
