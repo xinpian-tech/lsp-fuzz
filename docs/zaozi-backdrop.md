@@ -8,7 +8,8 @@ cold-replayed against the byte-identical backdrop.
 
 `jvm-coverage-agent/build-zaozi-backdrop.sh` builds and provenances that backdrop; it is
 **fail-closed** — a backdrop is only accepted if SemanticDB output exists, the BSP config is
-present, and the recorded snapshot hash matches on re-verification.
+present and its content matches the recorded `.bsp.sha256`, and the recorded sources+SemanticDB
+snapshot hash matches on re-verification.
 
 ## How the LS decides SemanticDB is available
 
@@ -82,8 +83,10 @@ surface.
   for `rvdecoderdb`, BSP config present, metadata complete, self-verify OK.
 - The SemanticDB payloads are genuine (e.g. `Instruction.scala.semanticdb` carries 657
   `org/chipsalliance/rvdecoderdb/…` symbol occurrences), not empty stubs.
-- `check-backdrop-failclosed.sh`: rejects missing-SemanticDB, missing-BSP, and content-drift;
-  accepts an intact copy at a different path (the snapshot hash is location-independent).
+- `check-backdrop-failclosed.sh`: rejects missing-SemanticDB, missing-BSP, sources/SemanticDB
+  content-drift, and tampered-BSP-content (mismatch against the recorded `.bsp.sha256`); accepts an
+  intact copy at a different path (the sources+SemanticDB snapshot hash is location-independent,
+  while the BSP file is pinned exactly by its own hash).
 
 ## Next
 

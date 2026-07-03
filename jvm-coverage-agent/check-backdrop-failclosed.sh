@@ -37,5 +37,9 @@ cp -r "$SRC" "$tmp/drift"; f=$(find "$tmp/drift/semanticdb" -name '*.semanticdb'
 printf 'tampered' >> "$f"
 expect_reject "a backdrop whose content drifted from the recorded hash" "$tmp/drift"
 
+# 4. Tampered BSP config content (present, but no longer matches the recorded .bsp.sha256).
+cp -r "$SRC" "$tmp/bsp-tamper"; printf '\n{"tampered":true}\n' >> "$tmp/bsp-tamper/bsp/mill-bsp.json"
+expect_reject "a backdrop whose BSP config content drifted from the recorded hash" "$tmp/bsp-tamper"
+
 [ "$fail" -eq 0 ] && echo "OK: build-zaozi-backdrop.sh verify mode is fail-closed" || echo "FAIL: fail-closed self-test had failures"
 exit $fail

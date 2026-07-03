@@ -50,11 +50,17 @@ assert_backdrop() {
   [ "$sdb" -gt 0 ] || die "no SemanticDB output in backdrop (index régime would be disabled)"
   [ -f "$root/bsp/mill-bsp.json" ] || die "BSP config absent: $root/bsp/mill-bsp.json"
   [ -f "$META" ] || die "metadata absent: $META"
-  local recorded computed
+  local recorded computed bsp_recorded bsp_computed
   recorded=$(jq -r '.snapshot.sha256' "$META")
   computed=$(snapshot_hash "$root")
   [ "$recorded" = "$computed" ] || die "snapshot hash mismatch: recorded=$recorded computed=$computed"
-  log "backdrop OK: $sdb SemanticDB files; BSP config present; snapshot hash $computed"
+  # BSP config is the live SemanticDB-activation channel and part of the pinned provenance, so its
+  # frozen content must match the recorded hash — not merely exist. (It carries machine-absolute
+  # launcher paths, so it is pinned exactly rather than folded into the portable snapshot hash.)
+  bsp_recorded=$(jq -r '.bsp.sha256' "$META")
+  bsp_computed=$(sha256sum "$root/bsp/mill-bsp.json" | cut -d' ' -f1)
+  [ "$bsp_recorded" = "$bsp_computed" ] || die "BSP config hash mismatch: recorded=$bsp_recorded computed=$bsp_computed"
+  log "backdrop OK: $sdb SemanticDB files; BSP config hash matches; snapshot hash $computed"
 }
 
 if [ -n "${VERIFY_ONLY:-}" ]; then
