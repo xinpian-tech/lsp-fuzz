@@ -2,7 +2,12 @@ package cov;
 
 import java.io.DataInputStream;
 import java.io.OutputStream;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.List;
+import java.util.concurrent.Callable;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
@@ -10,13 +15,17 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 
 /**
- * task5 verifier: drives the persistent {@link Worker} over its control protocol and asserts the
- * full task5 property set (saturation, non-empty/deterministic/input-sensitive coverage, a
- * 1000-identical-input stability gate, outcome classification with timeout kill + epoch restart,
- * and cold replay). Not instrumented. Exit code 0 iff every gate passes.
+ * task5 verifier: drives the persistent {@link WorkerHandle} over its control protocol and asserts
+ * the full task5 property set — saturation, non-empty/deterministic/input-sensitive coverage, an
+ * LSPFuzz-sized transport payload, a 1000-identical-input stability gate with bounded thread/fd
+ * growth, outcome classification with timeout kill + epoch restart, and saved-input cold replay.
+ * Not instrumented. Exit code 0 iff every gate passes.
  */
 public final class Harness {
     private static final int MAP_SIZE = Cov.MAP_SIZE;
+    private static final long HEAP_CEILING_BYTES = 512L * 1024 * 1024;
+    private static final int THREAD_TOLERANCE = 3;
+    private static final int FD_TOLERANCE = 8;
     private static final String[] JVM_FLAGS = {
         "-XX:-UseCompactObjectHeaders",
         "-Xshare:off",
@@ -29,11 +38,12 @@ public final class Harness {
     public static void main(String[] args) throws Exception {
         Harness h = new Harness();
         h.saturationGate();
-        Worker w = h.startWorker();
+        WorkerHandle w = new WorkerHandle();
         try {
             h.coverageGates(w);
+            h.transportGate(w);
             h.stabilityGate(w);
-            h.classificationGates(w);
+            h.classificationAndRestartGates(w);
         } finally {
             w.close();
         }
@@ -65,7 +75,7 @@ public final class Harness {
         Cov.reset();
     }
 
-    private void coverageGates(Worker w) throws Exception {
+    private void coverageGates(WorkerHandle w) throws Exception {
         Run a1 = w.run("abc".getBytes(), 5000);
         Run a2 = w.run("abc".getBytes(), 5000);
         Run b = w.run("z".getBytes(), 5000);
@@ -91,12 +101,29 @@ public final class Harness {
         }
     }
 
-    /** 1000 runs of the same input in one persistent JVM must all yield the same map. */
-    private void stabilityGate(Worker w) throws Exception {
+    /** LSPFuzz-sized transport: a large deterministic payload runs and is stable. */
+    private void transportGate(WorkerHandle w) throws Exception {
+        byte[] big = new byte[256 * 1024];
+        for (int i = 0; i < big.length; i++) {
+            big[i] = (byte) ((i % 251) + 1); // never 0x00/0xEE/0xFF at index 0
+        }
+        Run r1 = w.run(big, 10000);
+        Run r2 = w.run(big, 10000);
+        if (r1 != null && r2 != null && r1.outcome == 0 && countNonZero(r1.map) > 0
+                && Arrays.equals(r1.map, r2.map)) {
+            ok("transport: 256 KiB payload -> OK, non-empty, byte-identical maps");
+        } else {
+            fail("transport gate failed for 256 KiB payload");
+        }
+    }
+
+    /** 1000 runs of the same input in one persistent JVM: identical maps + bounded resources. */
+    private void stabilityGate(WorkerHandle w) throws Exception {
         byte[] input = "stability-probe".getBytes();
+        Status before = w.status(5000);
         Run first = w.run(input, 5000);
-        if (first == null) {
-            fail("stability gate: first run timed out");
+        if (before == null || first == null) {
+            fail("stability gate: setup timed out");
             return;
         }
         for (int i = 1; i < 1000; i++) {
@@ -106,14 +133,28 @@ public final class Harness {
                 return;
             }
         }
-        if (w.process.isAlive()) {
-            ok("1000-identical-input stability: byte-identical maps, one persistent worker");
+        Status after = w.status(5000);
+        if (after == null || !w.process.isAlive()) {
+            fail("stability gate: worker not responsive after loop");
+            return;
+        }
+        int threadGrowth = after.threads - before.threads;
+        long fdGrowth = after.fds - before.fds;
+        boolean bounded = threadGrowth <= THREAD_TOLERANCE
+                && fdGrowth <= FD_TOLERANCE
+                && after.usedHeap < HEAP_CEILING_BYTES;
+        String detail = "threads " + before.threads + "->" + after.threads
+                + ", fds " + before.fds + "->" + after.fds
+                + ", heap " + (after.usedHeap / (1024 * 1024)) + "MiB";
+        if (bounded) {
+            ok("1000-identical-input stability: byte-identical maps; bounded resources (" + detail + ")");
         } else {
-            fail("worker died during stability gate");
+            fail("stability gate: resource growth out of tolerance (" + detail + ")");
         }
     }
 
-    private void classificationGates(Worker w) throws Exception {
+    /** Classification + the actual timeout-kill-then-epoch-restart proof. */
+    private void classificationAndRestartGates(WorkerHandle w) throws Exception {
         Run normal = w.run("hello".getBytes(), 5000);
         if (normal != null && normal.outcome == 0) {
             ok("normal input classified OK");
@@ -126,27 +167,48 @@ public final class Harness {
         } else {
             fail("crash input not classified as CRASH");
         }
-        // Hang: no response within the timeout -> the worker is killed and a new epoch started.
+        // Hang -> no response within timeout -> the worker is force-killed.
         Run hang = w.run(new byte[] {(byte) 0xFF}, 1500);
-        if (hang == null) {
-            ok("hang input timed out (no response)");
-        } else {
+        if (hang != null) {
             fail("hang input unexpectedly returned outcome " + hang.outcome);
+            return;
+        }
+        w.process.waitFor(2, TimeUnit.SECONDS);
+        if (w.process.isAlive()) {
+            fail("hung worker was not killed");
+            return;
+        }
+        ok("hang input timed out and the worker was killed");
+        // Epoch restart: a fresh worker must serve a normal input with real coverage.
+        WorkerHandle restarted = new WorkerHandle();
+        try {
+            Run afterRestart = restarted.run("post-restart".getBytes(), 5000);
+            if (afterRestart != null && afterRestart.outcome == 0 && countNonZero(afterRestart.map) > 0) {
+                ok("epoch restart: fresh worker serves a normal input after the kill");
+            } else {
+                fail("epoch restart: fresh worker did not serve a normal input");
+            }
+        } finally {
+            restarted.close();
         }
     }
 
-    /** Cold replay: a saved crash input reproduces the same outcome class from a fresh JVM. */
+    /** Cold replay from a saved input file: reproduces the same outcome class from a fresh JVM. */
     private void coldReplayGate() throws Exception {
-        Worker fresh = startWorker();
+        Path replayFile = Path.of("replay-input.bin");
+        Files.write(replayFile, new byte[] {(byte) 0xEE}); // saved crash artifact
+        byte[] saved = Files.readAllBytes(replayFile);
+        WorkerHandle fresh = new WorkerHandle();
         try {
-            Run replay = fresh.run(new byte[] {(byte) 0xEE}, 5000);
+            Run replay = fresh.run(saved, 5000);
             if (replay != null && replay.outcome == 1 && countNonZero(replay.map) > 0) {
-                ok("cold replay: crash reproduced from a fresh JVM worker");
+                ok("cold replay: saved crash input reproduced from a fresh JVM worker");
             } else {
                 fail("cold replay did not reproduce the crash");
             }
         } finally {
             fresh.close();
+            Files.deleteIfExists(replayFile);
         }
     }
 
@@ -160,38 +222,27 @@ public final class Harness {
         return n;
     }
 
-    private Worker startWorker() throws Exception {
-        return new Worker();
-    }
+    private record Run(int outcome, byte[] map) {}
 
-    private static final class Run {
-        final int outcome;
-        final byte[] map;
-
-        Run(int outcome, byte[] map) {
-            this.outcome = outcome;
-            this.map = map;
-        }
-    }
+    private record Status(long usedHeap, int threads, long fds) {}
 
     /** Spawns and talks to the agent-instrumented worker JVM. */
-    private static final class Worker implements AutoCloseable {
+    private static final class WorkerHandle implements AutoCloseable {
         final Process process;
         private final OutputStream toWorker;
         private final DataInputStream fromWorker;
         private final ExecutorService reader = Executors.newSingleThreadExecutor();
 
-        Worker() throws Exception {
-            ProcessBuilder pb = new ProcessBuilder();
+        WorkerHandle() throws Exception {
             String java = System.getProperty("java.home") + "/bin/java";
-            java.util.List<String> cmd = new java.util.ArrayList<>();
+            List<String> cmd = new ArrayList<>();
             cmd.add(java);
             cmd.addAll(Arrays.asList(JVM_FLAGS));
             cmd.add("-javaagent:agent.jar");
             cmd.add("-cp");
             cmd.add("out");
             cmd.add("cov.Worker");
-            pb.command(cmd);
+            ProcessBuilder pb = new ProcessBuilder(cmd);
             pb.environment().put("COV_MAP_PATH", "map-latest.bin");
             pb.redirectError(ProcessBuilder.Redirect.INHERIT);
             this.process = pb.start();
@@ -207,13 +258,23 @@ public final class Harness {
             toWorker.write(input.length & 0xff);
             toWorker.write(input);
             toWorker.flush();
-
-            Future<Run> f = reader.submit(() -> {
+            return await(() -> {
                 int outcome = fromWorker.readUnsignedByte();
                 byte[] map = new byte[MAP_SIZE];
                 fromWorker.readFully(map);
                 return new Run(outcome, map);
-            });
+            }, timeoutMs);
+        }
+
+        Status status(long timeoutMs) throws Exception {
+            toWorker.write('S');
+            toWorker.flush();
+            return await(() -> new Status(fromWorker.readLong(), fromWorker.readInt(),
+                    fromWorker.readLong()), timeoutMs);
+        }
+
+        private <T> T await(Callable<T> read, long timeoutMs) throws Exception {
+            Future<T> f = reader.submit(read);
             try {
                 return f.get(timeoutMs, TimeUnit.MILLISECONDS);
             } catch (TimeoutException e) {
