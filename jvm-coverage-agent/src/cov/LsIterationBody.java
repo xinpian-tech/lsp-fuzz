@@ -183,8 +183,8 @@ public final class LsIterationBody implements IterationBody {
             // under whatever generation is currently active — it cannot carry a single captured
             // generation without suppressing later inputs' coverage. Cross-input safety instead comes
             // from tracking each request future so quiescence drains the server's work within the
-            // input, plus the snapshot/late-watch/pre-reset guards. Detached generation-scoped
-            // background executors belong to the BSP/index profile (task-level follow-up).
+            // input, plus the snapshot/late-watch/pre-reset guards. Scoping detached index-mode
+            // background executors to their generation is follow-up work.
             ExecutorService exec = Executors.newCachedThreadPool(r -> {
                 Thread t = new Thread(r, "lsp-fuzz-ls");
                 t.setDaemon(true);

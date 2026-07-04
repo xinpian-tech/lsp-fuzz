@@ -17,13 +17,24 @@ fn javac_available() -> bool {
         .is_ok_and(|s| s.success())
 }
 
+/// Panic (not skip) when a checked-in Java source is missing: a repository/source-list regression,
+/// not an unavailable external toolchain. Lists every missing path.
+fn assert_sources_present(sources: &[String]) {
+    let missing: Vec<&str> = sources
+        .iter()
+        .filter(|s| !Path::new(s).exists())
+        .map(String::as_str)
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "checked-in Java worker sources are missing:\n{}",
+        missing.join("\n")
+    );
+}
+
 #[test]
 #[allow(clippy::too_many_lines, reason = "linear end-to-end smoke setup")]
 fn jvm_mode_fuzz_smoke_reaches_loop_without_deadlock() {
-    if !javac_available() {
-        eprintln!("skipping: javac unavailable");
-        return;
-    }
     let agent = concat!(env!("CARGO_MANIFEST_DIR"), "/../../jvm-coverage-agent/src");
     let sources = [
         format!("{agent}/cov/Cov.java"),
@@ -35,18 +46,13 @@ fn jvm_mode_fuzz_smoke_reaches_loop_without_deadlock() {
         format!("{agent}/fixture/Target.java"),
         format!("{agent}/fixture/LateWriteFixture.java"),
     ];
-    // Missing checked-in sources are a repository/source-list regression, not an unavailable
-    // toolchain — fail hard, listing the missing paths. Only a missing javac (below) skips.
-    let missing: Vec<&str> = sources
-        .iter()
-        .filter(|s| !Path::new(s).exists())
-        .map(String::as_str)
-        .collect();
-    assert!(
-        missing.is_empty(),
-        "checked-in Java worker sources are missing:\n{}",
-        missing.join("\n")
-    );
+    // Prove the checked-in sources exist BEFORE deciding whether the external toolchain is missing,
+    // so a source-list regression fails even in a no-JDK shell. Only then may a missing javac skip.
+    assert_sources_present(&sources);
+    if !javac_available() {
+        eprintln!("skipping: javac unavailable");
+        return;
+    }
     let tmp = tempfile::tempdir().unwrap();
     let out = tmp.path().join("out");
     std::fs::create_dir_all(&out).unwrap();
