@@ -40,11 +40,19 @@ public final class Harness {
 
     private int failures = 0;
 
+    // Sharp lifecycle windows for the standard worker: keep per-run overhead tiny (the stability
+    // gate does 1000 runs) while still exercising quiesce/snapshot/late-watch.
+    private static final Map<String, String> FAST_WINDOWS = Map.of(
+            "COV_SETTLE_MS", "1",
+            "COV_LATE_WATCH_MS", "1",
+            "COV_QUIESCE_DEADLINE_MS", "2000");
+
     public static void main(String[] args) throws Exception {
         Harness h = new Harness();
         h.saturationGate();
         h.classReachOracleGate();
-        WorkerHandle w = new WorkerHandle();
+        h.lateWriteGuardGate();
+        WorkerHandle w = new WorkerHandle(FAST_WINDOWS);
         try {
             h.coverageGates(w);
             h.transportGate(w);
@@ -53,6 +61,10 @@ public final class Harness {
         } finally {
             w.close();
         }
+        h.lifecycleQuiesceWaitGate();
+        h.lifecycleQuiesceTimeoutGate();
+        h.lifecycleSnapshotRaceGate();
+        h.lifecycleLateWriteNoBleedGate();
         h.coldReplayGate();
         System.exit(h.failures == 0 ? 0 : 1);
     }
@@ -237,6 +249,113 @@ public final class Harness {
         }
     }
 
+    /**
+     * Generation guard (the mechanism behind refusing input N+1): a write after the snapshot is
+     * closed for a generation must flag that generation as late-written and bump the write count.
+     */
+    private void lateWriteGuardGate() {
+        // This gate runs in the un-instrumented harness JVM, so drive Cov.hit directly (as the
+        // agent's injected probe would) rather than through an instrumented fixture method.
+        Cov.reset(7);
+        long before = Cov.writes();
+        Cov.markSnapshotClosed(7);
+        Cov.hit(12345); // a coverage write under the now-closed generation
+        if (Cov.hadLateWrite(7) && Cov.writes() != before) {
+            ok("late-write guard: a post-snapshot write taints its generation (writes " + before
+                    + "->" + Cov.writes() + ")");
+        } else {
+            fail("late-write guard did not flag a post-snapshot write");
+        }
+        Cov.reset();
+    }
+
+    /** A tracked background write that completes during quiescence must be waited for and attributed. */
+    private void lifecycleQuiesceWaitGate() throws Exception {
+        WorkerHandle w = new WorkerHandle(FAST_WINDOWS);
+        try {
+            Run r = w.run(new byte[] {(byte) 0xE0}, 5000);
+            if (r != null && r.status == 0 && countNonZero(r.map) > 0) {
+                ok("quiescence waits: tracked background write attributed (OkSnapshot, non-empty map)");
+            } else {
+                fail("quiescence-wait gate failed: " + describe(r));
+            }
+        } finally {
+            w.close();
+        }
+    }
+
+    /** A background task that never completes must trip the quiescence deadline, not hang forever. */
+    private void lifecycleQuiesceTimeoutGate() throws Exception {
+        Map<String, String> env = Map.of(
+                "COV_SETTLE_MS", "1",
+                "COV_LATE_WATCH_MS", "1",
+                "COV_QUIESCE_DEADLINE_MS", "300");
+        WorkerHandle w = new WorkerHandle(env);
+        try {
+            Run r = w.run(new byte[] {(byte) 0xE1}, 5000);
+            if (r != null && r.status == 2) {
+                ok("quiescence deadline: never-completing background task -> TimeoutQuiescence");
+            } else {
+                fail("quiescence-timeout gate failed: " + describe(r));
+            }
+        } finally {
+            w.close();
+        }
+    }
+
+    /** A write landing mid-snapshot must be caught by double-snapshot validation. */
+    private void lifecycleSnapshotRaceGate() throws Exception {
+        WorkerHandle w = new WorkerHandle(FAST_WINDOWS);
+        try {
+            Run r = w.run(new byte[] {(byte) 0xE3}, 5000);
+            if (r != null && r.status == 4) {
+                ok("snapshot race: mid-copy write -> SnapshotRace (coverage rejected)");
+            } else {
+                fail("snapshot-race gate failed: " + describe(r));
+            }
+        } finally {
+            w.close();
+        }
+    }
+
+    /**
+     * A write after the snapshot is detected as LateCoverage, and a following clean input's map
+     * carries no residue of the late edge (attribution does not bleed across inputs).
+     */
+    private void lifecycleLateWriteNoBleedGate() throws Exception {
+        byte[] clean = "clean-baseline".getBytes();
+        byte[] baselineMap;
+        WorkerHandle base = new WorkerHandle(FAST_WINDOWS);
+        try {
+            Run r = base.run(clean, 5000);
+            if (r == null || r.status != 0) {
+                fail("no-bleed gate: baseline clean run failed: " + describe(r));
+                return;
+            }
+            baselineMap = r.map;
+        } finally {
+            base.close();
+        }
+        WorkerHandle w = new WorkerHandle(FAST_WINDOWS);
+        try {
+            Run late = w.run(new byte[] {(byte) 0xE2}, 5000);
+            if (late == null || late.status != 3) {
+                fail("no-bleed gate: late write not detected as LateCoverage: " + describe(late));
+                return;
+            }
+            Run afterLate = w.run(clean, 5000); // reset must clear the late edge
+            if (afterLate != null && afterLate.status == 0
+                    && Arrays.equals(afterLate.map, baselineMap)) {
+                ok("late coverage detected; a following clean input's map matches baseline (no bleed)");
+            } else {
+                fail("no-bleed gate: clean run after late write diverged from baseline: "
+                        + describe(afterLate));
+            }
+        } finally {
+            w.close();
+        }
+    }
+
     /** Cold replay from a saved input file: reproduces the same outcome class from a fresh JVM. */
     private void coldReplayGate() throws Exception {
         Path replayFile = Path.of("replay-input.bin");
@@ -266,7 +385,12 @@ public final class Harness {
         return n;
     }
 
-    private record Run(int outcome, byte[] map) {}
+    private record Run(int outcome, int status, byte[] map) {}
+
+    private static String describe(Run r) {
+        return r == null ? "no reply (timed out/killed)"
+                : "status=" + r.status + ", edges=" + countNonZero(r.map);
+    }
 
     private record Status(long usedHeap, int threads, long fds) {}
 
@@ -279,6 +403,10 @@ public final class Harness {
         private final ExecutorService reader = Executors.newSingleThreadExecutor();
 
         WorkerHandle() throws Exception {
+            this(Map.of());
+        }
+
+        WorkerHandle(Map<String, String> extraEnv) throws Exception {
             String java = System.getProperty("java.home") + "/bin/java";
             this.mapPath = "map-" + System.nanoTime() + ".bin";
             List<String> cmd = new ArrayList<>();
@@ -290,6 +418,7 @@ public final class Harness {
             cmd.add("cov.Worker");
             ProcessBuilder pb = new ProcessBuilder(cmd);
             pb.environment().put("COV_MAP_PATH", mapPath);
+            pb.environment().putAll(extraEnv);
             pb.redirectError(ProcessBuilder.Redirect.INHERIT);
             this.process = pb.start();
             this.toWorker = process.getOutputStream();
@@ -312,7 +441,7 @@ public final class Harness {
             int status = body[0] & 0xff;
             int outcome = status == 0 ? 0 : 1; // OkSnapshot -> OK; anything else -> CRASH
             byte[] map = Files.readAllBytes(Path.of(mapPath));
-            return new Run(outcome, map);
+            return new Run(outcome, status, map);
         }
 
         Status status(long timeoutMs) throws Exception {

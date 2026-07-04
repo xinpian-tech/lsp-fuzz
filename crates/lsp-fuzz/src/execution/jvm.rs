@@ -938,8 +938,12 @@ mod tests {
         let agent = concat!(env!("CARGO_MANIFEST_DIR"), "/../../jvm-coverage-agent/src");
         let sources = [
             format!("{agent}/cov/Cov.java"),
+            format!("{agent}/cov/Lifecycle.java"),
+            format!("{agent}/cov/IterationBody.java"),
+            format!("{agent}/cov/FixtureBody.java"),
             format!("{agent}/cov/Worker.java"),
             format!("{agent}/fixture/Target.java"),
+            format!("{agent}/fixture/LateWriteFixture.java"),
         ];
         if !sources.iter().all(|s| std::path::Path::new(s).exists()) {
             return; // sources not laid out as expected: skip
@@ -984,5 +988,114 @@ mod tests {
             "worker reports at least its own thread"
         );
         // Dropping the worker/transport reaps the child.
+    }
+
+    /// End-to-end coverage-lifecycle check on the real Java worker (no coverage agent needed — the
+    /// planted fixture records its edge directly). Drives the real subprocess transport and proves
+    /// the attribution contract: a clean input is attributable; a planted late write and a planted
+    /// snapshot race are both discarded and force an epoch restart; and after a fresh epoch a clean
+    /// input's copied map matches the baseline, so a discarded late edge never bleeds into the next
+    /// input. Skips if the JDK is absent.
+    #[test]
+    fn real_java_worker_lifecycle_attribution_and_restart() {
+        let agent = concat!(env!("CARGO_MANIFEST_DIR"), "/../../jvm-coverage-agent/src");
+        let sources = [
+            format!("{agent}/cov/Cov.java"),
+            format!("{agent}/cov/Lifecycle.java"),
+            format!("{agent}/cov/IterationBody.java"),
+            format!("{agent}/cov/FixtureBody.java"),
+            format!("{agent}/cov/Worker.java"),
+            format!("{agent}/fixture/Target.java"),
+            format!("{agent}/fixture/LateWriteFixture.java"),
+        ];
+        if !sources.iter().all(|s| std::path::Path::new(s).exists()) {
+            return; // sources not laid out as expected: skip
+        }
+        let out = tempfile::tempdir().unwrap();
+        let compiled = Command::new("javac")
+            .arg("-d")
+            .arg(out.path())
+            .args(&sources)
+            .status();
+        match compiled {
+            Ok(status) if status.success() => {}
+            _ => return, // javac unavailable or failed to compile: skip
+        }
+
+        // Spawn one worker epoch with sharp lifecycle windows so the test is fast and deterministic.
+        let spawn = |map_file: &std::path::Path| -> Option<JvmWorker<SubprocessTransport>> {
+            let mut command = Command::new("java");
+            command
+                .arg("-cp")
+                .arg(out.path())
+                .arg("cov.Worker")
+                .env("COV_MAP_PATH", map_file)
+                .env("COV_SETTLE_MS", "1")
+                .env("COV_LATE_WATCH_MS", "1")
+                .env("COV_QUIESCE_DEADLINE_MS", "2000");
+            let transport = SubprocessTransport::spawn(command).ok()?;
+            Some(JvmWorker::new(transport, map_file, Duration::from_secs(30)))
+        };
+
+        let planted_late: &[u8] = &[0xE2];
+        let planted_race: &[u8] = &[0xE3];
+        let clean: &[u8] = &[0x01];
+
+        let mut buf: Box<[u8; MAP_SIZE]> =
+            vec![0u8; MAP_SIZE].into_boxed_slice().try_into().unwrap();
+
+        // Epoch A: a clean input (accepted, attributable), then a planted late write (discarded).
+        let map_a = out.path().join("map_a.bin");
+        let Some(mut worker) = spawn(&map_a) else {
+            return;
+        };
+        let clean_outcome = worker.run_capturing(clean, &mut buf);
+        assert!(
+            clean_outcome.coverage_attributable && !clean_outcome.restart_required,
+            "a clean input must be an attributable snapshot: {clean_outcome:?}"
+        );
+        let baseline = buf.clone();
+
+        let late_outcome = worker.run_capturing(planted_late, &mut buf);
+        assert!(
+            !late_outcome.coverage_attributable
+                && late_outcome.restart_required
+                && late_outcome.instability,
+            "a late write must be discarded and force a restart: {late_outcome:?}"
+        );
+        assert!(
+            buf.iter().all(|&b| b == 0),
+            "discarded late coverage must zero the observer buffer"
+        );
+        drop(worker); // the executor would kill the tainted epoch here
+
+        // Epoch B (the restart): a fresh worker serves the same clean input, and its copied map
+        // matches the baseline — the discarded late edge did not bleed into the next input.
+        let map_b = out.path().join("map_b.bin");
+        let Some(mut fresh) = spawn(&map_b) else {
+            return;
+        };
+        let post_restart = fresh.run_capturing(clean, &mut buf);
+        assert!(
+            post_restart.coverage_attributable && !post_restart.restart_required,
+            "the post-restart clean input must be attributable: {post_restart:?}"
+        );
+        assert_eq!(
+            buf.as_slice(),
+            baseline.as_slice(),
+            "post-restart clean map must match the baseline (no late-edge bleed)"
+        );
+        drop(fresh);
+
+        // Epoch C: a planted snapshot race is discarded and forces a restart.
+        let map_c = out.path().join("map_c.bin");
+        let Some(mut racer) = spawn(&map_c) else {
+            return;
+        };
+        let race_outcome = racer.run_capturing(planted_race, &mut buf);
+        assert!(
+            !race_outcome.coverage_attributable && race_outcome.restart_required,
+            "a snapshot race must be discarded and force a restart: {race_outcome:?}"
+        );
     }
 }

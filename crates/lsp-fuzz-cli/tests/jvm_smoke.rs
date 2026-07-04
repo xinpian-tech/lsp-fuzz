@@ -27,8 +27,12 @@ fn jvm_mode_fuzz_smoke_reaches_loop_without_deadlock() {
     let agent = concat!(env!("CARGO_MANIFEST_DIR"), "/../../jvm-coverage-agent/src");
     let sources = [
         format!("{agent}/cov/Cov.java"),
+        format!("{agent}/cov/Lifecycle.java"),
+        format!("{agent}/cov/IterationBody.java"),
+        format!("{agent}/cov/FixtureBody.java"),
         format!("{agent}/cov/Worker.java"),
         format!("{agent}/fixture/Target.java"),
+        format!("{agent}/fixture/LateWriteFixture.java"),
     ];
     if !sources.iter().all(|s| Path::new(s).exists()) {
         eprintln!("skipping: worker sources not found");

@@ -2,7 +2,10 @@
 # Build the ASM bytecode-coverage agent + persistent worker + fixture, then run the harness
 # which asserts: saturating counters, non-empty/deterministic/input-sensitive basic-block coverage,
 # a 1000-identical-input stability gate, outcome classification (normal/crash/hang-timeout+restart),
-# and cold replay from a fresh JVM. See docs/jvm-coverage-agent.md.
+# the per-iteration coverage lifecycle (late-write generation guard, quiescence waits for tracked
+# background writes, quiescence deadline on a never-completing task, snapshot-race rejection, and
+# late-write detection with no bleed into the next input), and cold replay from a fresh JVM.
+# See docs/jvm-coverage-agent.md and docs/jvm-coverage-lifecycle.md.
 #
 # Run inside the JVM dev shell:  nix develop .#jvm -c ./jvm-coverage-agent/build-and-check.sh
 set -euo pipefail
