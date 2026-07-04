@@ -1168,20 +1168,7 @@ mod tests {
     #[test]
     fn real_java_worker_round_trip() {
         let agent = concat!(env!("CARGO_MANIFEST_DIR"), "/../../jvm-coverage-agent/src");
-        let sources = [
-            format!("{agent}/cov/Cov.java"),
-            format!("{agent}/cov/Lifecycle.java"),
-            format!("{agent}/cov/Evidence.java"),
-            format!("{agent}/cov/RunOutcome.java"),
-            format!("{agent}/cov/Findings.java"),
-            format!("{agent}/cov/IterationBody.java"),
-            format!("{agent}/cov/FixtureBody.java"),
-            format!("{agent}/cov/LsIterationBody.java"),
-            format!("{agent}/cov/RunBudgetExceededException.java"),
-            format!("{agent}/cov/Worker.java"),
-            format!("{agent}/fixture/Target.java"),
-            format!("{agent}/fixture/LateWriteFixture.java"),
-        ];
+        let sources = agent_source_list(agent);
         assert_sources_present(&sources);
         let out = tempfile::tempdir().unwrap();
         let compiled = Command::new("javac")
@@ -1237,20 +1224,7 @@ mod tests {
         use crate::findings::findings_from_jvm_side_channel;
 
         let agent = concat!(env!("CARGO_MANIFEST_DIR"), "/../../jvm-coverage-agent/src");
-        let sources = [
-            format!("{agent}/cov/Cov.java"),
-            format!("{agent}/cov/Lifecycle.java"),
-            format!("{agent}/cov/Evidence.java"),
-            format!("{agent}/cov/RunOutcome.java"),
-            format!("{agent}/cov/Findings.java"),
-            format!("{agent}/cov/IterationBody.java"),
-            format!("{agent}/cov/FixtureBody.java"),
-            format!("{agent}/cov/LsIterationBody.java"),
-            format!("{agent}/cov/RunBudgetExceededException.java"),
-            format!("{agent}/cov/Worker.java"),
-            format!("{agent}/fixture/Target.java"),
-            format!("{agent}/fixture/LateWriteFixture.java"),
-        ];
+        let sources = agent_source_list(agent);
         assert_sources_present(&sources);
         let out = tempfile::tempdir().unwrap();
         let compiled = Command::new("javac")
@@ -1359,20 +1333,7 @@ mod tests {
     #[test]
     fn real_java_worker_lifecycle_attribution_and_restart() {
         let agent = concat!(env!("CARGO_MANIFEST_DIR"), "/../../jvm-coverage-agent/src");
-        let sources = [
-            format!("{agent}/cov/Cov.java"),
-            format!("{agent}/cov/Lifecycle.java"),
-            format!("{agent}/cov/Evidence.java"),
-            format!("{agent}/cov/RunOutcome.java"),
-            format!("{agent}/cov/Findings.java"),
-            format!("{agent}/cov/IterationBody.java"),
-            format!("{agent}/cov/FixtureBody.java"),
-            format!("{agent}/cov/LsIterationBody.java"),
-            format!("{agent}/cov/RunBudgetExceededException.java"),
-            format!("{agent}/cov/Worker.java"),
-            format!("{agent}/fixture/Target.java"),
-            format!("{agent}/fixture/LateWriteFixture.java"),
-        ];
+        let sources = agent_source_list(agent);
         assert_sources_present(&sources);
         let out = tempfile::tempdir().unwrap();
         let compiled = Command::new("javac")
@@ -1535,20 +1496,7 @@ mod tests {
         };
 
         let agent = concat!(env!("CARGO_MANIFEST_DIR"), "/../../jvm-coverage-agent/src");
-        let sources = [
-            format!("{agent}/cov/Cov.java"),
-            format!("{agent}/cov/Lifecycle.java"),
-            format!("{agent}/cov/Evidence.java"),
-            format!("{agent}/cov/RunOutcome.java"),
-            format!("{agent}/cov/Findings.java"),
-            format!("{agent}/cov/IterationBody.java"),
-            format!("{agent}/cov/FixtureBody.java"),
-            format!("{agent}/cov/LsIterationBody.java"),
-            format!("{agent}/cov/RunBudgetExceededException.java"),
-            format!("{agent}/cov/Worker.java"),
-            format!("{agent}/fixture/Target.java"),
-            format!("{agent}/fixture/LateWriteFixture.java"),
-        ];
+        let sources = agent_source_list(agent);
         assert_sources_present(&sources);
         let out = tempfile::tempdir().unwrap();
         let compiled = Command::new(&javac)
@@ -1570,20 +1518,17 @@ mod tests {
         let classes_file = out.path().join("ls-classes.txt");
         let requests_file = out.path().join("ls-requests.txt");
         let classpath = format!("{}:{}", out.path().display(), ls_jar.display());
-        let mut command = Command::new(&java);
-        command.arg("--enable-native-access=ALL-UNNAMED");
         // With the coverage agent attached, real language-server classes are instrumented and their
         // reach is recorded; without it the lifecycle/attribution is still exercised (empty map).
         let agent_jar = std::env::var_os("COV_AGENT_JAR").map(std::path::PathBuf::from);
         let agent_attached = agent_jar.as_ref().is_some_and(|j| j.exists());
-        if let Some(jar) = agent_jar.as_ref().filter(|j| j.exists()) {
-            command.arg(format!("-javaagent:{}", jar.display()));
-            command.env("COV_CLASSES_PATH", &classes_file);
-        }
+        let mut command = ls_worker_command(
+            &java,
+            &classpath,
+            agent_jar.as_deref().filter(|j| j.exists()),
+            &classes_file,
+        );
         command
-            .arg("-cp")
-            .arg(&classpath)
-            .arg("cov.Worker")
             .env("COV_ITERATION_BODY", "ls")
             .env("COV_MAP_PATH", &map_file)
             .env("COV_REQUESTS_PATH", &requests_file)
@@ -1645,6 +1590,142 @@ mod tests {
         );
     }
 
+    /// Real in-process INDEX-mode lifecycle across a generation boundary: drive an index request
+    /// (`textDocument/references`) over the frozen backdrop overlay as input N — engaging the real
+    /// index/BSP/SQLite/PC executors and any background work they spawn — then a clean input N+1, and
+    /// prove N+1 is an attributable, uncontaminated snapshot. This exercises the detached-executor
+    /// scoping the per-iteration lifecycle must uphold: the quiescence + double-snapshot + late-watch +
+    /// pre-reset guards must ensure N's detached PC/BSP/index writes are never attributed to N+1 (an
+    /// attributable outcome means the guards found no straggler/late/cross-generation write; if the LS
+    /// cannot quiesce its detached work the guard instead trips to a non-attributable restart — never a
+    /// silently attributed contaminated snapshot). Gated on the LS jar + `BACKDROP_OUT` + `LS_SQLITE_LIB`
+    /// (the index mode's requirements), run under the pinned JDK; skips loudly otherwise.
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "linear end-to-end real-LS index setup"
+    )]
+    fn real_in_process_ls_index_worker_generation_scoping() {
+        use libafl::inputs::ToTargetBytes;
+        let Some(ls_jar) = std::env::var_os("LS_JAR") else {
+            eprintln!("skipping ls_index_worker_generation_scoping: LS_JAR unset");
+            return;
+        };
+        let ls_jar = std::path::PathBuf::from(ls_jar);
+        if !ls_jar.exists() {
+            eprintln!("skipping: LS_JAR does not exist: {}", ls_jar.display());
+            return;
+        }
+        // Index mode requires the verified frozen backdrop + the pinned native SQLite library.
+        if std::env::var_os("BACKDROP_OUT").is_none() || std::env::var_os("LS_SQLITE_LIB").is_none()
+        {
+            eprintln!("skipping: index mode needs BACKDROP_OUT + LS_SQLITE_LIB");
+            return;
+        }
+        let java = std::env::var_os("LS_JAVA")
+            .map(std::path::PathBuf::from)
+            .or_else(|| pinned_java_from_wrapper(&ls_jar))
+            .unwrap_or_else(|| std::path::PathBuf::from("java"));
+        let Some(javac) = java
+            .parent()
+            .map(|b| b.join("javac"))
+            .filter(|p| p.exists())
+        else {
+            eprintln!("skipping: no javac next to {}", java.display());
+            return;
+        };
+
+        let agent = concat!(env!("CARGO_MANIFEST_DIR"), "/../../jvm-coverage-agent/src");
+        let sources = agent_source_list(agent);
+        assert_sources_present(&sources);
+        let out = tempfile::tempdir().unwrap();
+        match Command::new(&javac)
+            .arg("-d")
+            .arg(out.path())
+            .args(&sources)
+            .status()
+        {
+            Ok(status) if status.success() => {}
+            Ok(_) => panic!("agent sources failed to compile with {}", javac.display()),
+            Err(_) => {
+                eprintln!("skipping: could not run javac at {}", javac.display());
+                return;
+            }
+        }
+
+        let map_file = out.path().join("idx-map.bin");
+        let classes_file = out.path().join("idx-classes.txt");
+        let classpath = format!("{}:{}", out.path().display(), ls_jar.display());
+        let agent_jar = std::env::var_os("COV_AGENT_JAR").map(std::path::PathBuf::from);
+        let agent_attached = agent_jar.as_ref().is_some_and(|j| j.exists());
+        let mut command = ls_worker_command(
+            &java,
+            &classpath,
+            agent_jar.as_deref().filter(|j| j.exists()),
+            &classes_file,
+        );
+        // A generous quiescence deadline so the index/BSP bootstrap + request work settles within the
+        // input window (the residual detached-executor concern is a thread that wakes AFTER this).
+        command
+            .env("COV_ITERATION_BODY", "ls")
+            .env("COV_MAP_PATH", &map_file)
+            .env("COV_SETTLE_MS", "50")
+            .env("COV_LATE_WATCH_MS", "50")
+            .env("COV_QUIESCE_DEADLINE_MS", "20000");
+        let Ok(transport) = SubprocessTransport::spawn(command) else {
+            eprintln!("skipping: could not spawn the in-process index LS worker");
+            return;
+        };
+        // Index bootstrap is slow on a cold JVM; give the worker a generous reply deadline.
+        let mut worker = JvmWorker::new(transport, &map_file, Duration::from_mins(3));
+        let mut buf: Box<[u8; MAP_SIZE]> =
+            vec![0u8; MAP_SIZE].into_boxed_slice().try_into().unwrap();
+
+        // Index-mode converter: overlays the verified backdrop (from BACKDROP_OUT) and rewrites URIs.
+        let mut converter = crate::lsp_input::JvmLspInputConverter::new(
+            out.path().to_path_buf(),
+            crate::execution::scala_profile::ScalaExecutionProfile::index(),
+        );
+
+        // Input N: a references request over the backdrop overlay — drives the real index path and any
+        // background index/BSP/PC work it spawns.
+        let input_n = index_references_input("main.scala", "object M:\n  val nn = 1\n");
+        let outcome_n =
+            worker.run_capturing(&converter.to_target_bytes(&input_n).to_vec(), &mut buf);
+        // N must at least complete without deadlock; an attributable outcome is the common case, but a
+        // restart (guard tripped on N's own detached work) is also valid — the point is N+1's integrity.
+        assert!(
+            outcome_n.coverage_attributable || outcome_n.restart_required,
+            "input N must resolve to a definite lifecycle outcome, not hang: {outcome_n:?}"
+        );
+
+        // Input N+1: a clean, different single-file references input. It must be an attributable,
+        // uncontaminated snapshot (the guards confirm no straggler/late/cross-generation write from N),
+        // OR the guard must have tripped to a non-attributable restart — never silently contaminated.
+        let input_n1 = index_references_input("other.scala", "object O:\n  val oo = 2\n");
+        let outcome_n1 =
+            worker.run_capturing(&converter.to_target_bytes(&input_n1).to_vec(), &mut buf);
+        assert!(
+            outcome_n1.coverage_attributable != outcome_n1.restart_required,
+            "N+1 must be either a clean attributable snapshot or a tripped-guard restart, never both \
+             nor a silently attributed contaminated run: {outcome_n1:?}"
+        );
+        assert!(
+            outcome_n1.coverage_attributable && !outcome_n1.restart_required,
+            "the detached index/BSP work from N must quiesce so N+1 is attributable + uncontaminated \
+             (if this ever regresses to a restart, the detached-executor scoping is not holding): \
+             {outcome_n1:?}"
+        );
+
+        if agent_attached {
+            let classes = std::fs::read_to_string(&classes_file).unwrap_or_default();
+            assert!(
+                classes.lines().any(|c| c.starts_with("ls.")),
+                "index requests should reach real ls.* classes; covered:\n{classes}"
+            );
+        }
+    }
+
     #[cfg(test)]
     fn scala_document(source: &str) -> crate::text_document::TextDocument {
         let mut doc = crate::text_document::TextDocument::new(
@@ -1684,6 +1765,40 @@ mod tests {
     }
 
     #[cfg(test)]
+    fn references_message(uri: lsp_types::Uri) -> crate::lsp::LspMessage {
+        crate::lsp::LspMessage::from_params::<lsp_types::request::References>(
+            lsp_types::ReferenceParams {
+                text_document_position: lsp_types::TextDocumentPositionParams {
+                    text_document: lsp_types::TextDocumentIdentifier { uri },
+                    position: lsp_types::Position::new(1, 6),
+                },
+                work_done_progress_params: lsp_types::WorkDoneProgressParams::default(),
+                partial_result_params: lsp_types::PartialResultParams::default(),
+                context: lsp_types::ReferenceContext {
+                    include_declaration: true,
+                },
+            },
+        )
+    }
+
+    /// A single-file Scala workspace whose one stored message is a `textDocument/references` request —
+    /// an index-mode-allowed method that drives the real index/BSP/SQLite lookup path.
+    #[cfg(test)]
+    fn index_references_input(file: &str, source: &str) -> crate::lsp_input::LspInput {
+        use crate::utf8::Utf8Input;
+        let workspace = crate::file_system::FileSystemDirectory::from([(
+            Utf8Input::new(file.to_owned()),
+            source_entry(source),
+        )]);
+        let mut messages = crate::lsp_input::messages::LspMessageSequence::default();
+        messages.push(references_message(virtual_uri(file)));
+        crate::lsp_input::LspInput {
+            messages,
+            workspace,
+        }
+    }
+
+    #[cfg(test)]
     fn source_entry(
         source: &str,
     ) -> crate::file_system::FileSystemEntry<crate::lsp_input::WorkspaceEntry> {
@@ -1696,6 +1811,56 @@ mod tests {
     fn virtual_uri(name: &str) -> lsp_types::Uri {
         crate::lsp_input::uri::virtual_uri_for_path(std::path::Path::new(name))
             .expect("virtual URI for a workspace file")
+    }
+
+    #[cfg(test)]
+    /// The agent + fixture Java sources the in-process LS worker tests compile (shared so every gated
+    /// test lists the exact same set; a missing checked-in source is a hard failure, not a skip).
+    #[cfg(test)]
+    fn agent_source_list(agent: &str) -> Vec<String> {
+        [
+            "cov/Cov.java",
+            "cov/Lifecycle.java",
+            "cov/Evidence.java",
+            "cov/RunOutcome.java",
+            "cov/Findings.java",
+            "cov/IterationBody.java",
+            "cov/FixtureBody.java",
+            "cov/LsIterationBody.java",
+            "cov/RunBudgetExceededException.java",
+            "cov/Worker.java",
+            "fixture/Target.java",
+            "fixture/LateWriteFixture.java",
+        ]
+        .iter()
+        .map(|rel| format!("{agent}/{rel}"))
+        .collect()
+    }
+
+    /// Build the `cov.Worker` JVM launch used by the in-process LS worker tests, under the SAME
+    /// determinism flags the enforced fuzzing/cold-replay/index-gate surfaces use (so this live
+    /// evidence runs the server in the same configuration), plus native access and — when a coverage
+    /// agent jar is given — the agent + covered-class path. The caller adds the per-test env.
+    #[cfg(test)]
+    fn ls_worker_command(
+        java: &std::path::Path,
+        classpath: &str,
+        agent_jar: Option<&std::path::Path>,
+        classes_file: &std::path::Path,
+    ) -> Command {
+        let mut command = Command::new(java);
+        for flag in crate::execution::scala_profile::ScalaExecutionProfile::presentation_compiler()
+            .determinism_flags()
+        {
+            command.arg(flag);
+        }
+        command.arg("--enable-native-access=ALL-UNNAMED");
+        if let Some(jar) = agent_jar {
+            command.arg(format!("-javaagent:{}", jar.display()));
+            command.env("COV_CLASSES_PATH", classes_file);
+        }
+        command.arg("-cp").arg(classpath).arg("cov.Worker");
+        command
     }
 
     #[cfg(test)]
