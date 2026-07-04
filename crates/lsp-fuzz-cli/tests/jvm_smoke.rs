@@ -35,10 +35,18 @@ fn jvm_mode_fuzz_smoke_reaches_loop_without_deadlock() {
         format!("{agent}/fixture/Target.java"),
         format!("{agent}/fixture/LateWriteFixture.java"),
     ];
-    if !sources.iter().all(|s| Path::new(s).exists()) {
-        eprintln!("skipping: worker sources not found");
-        return;
-    }
+    // Missing checked-in sources are a repository/source-list regression, not an unavailable
+    // toolchain — fail hard, listing the missing paths. Only a missing javac (below) skips.
+    let missing: Vec<&str> = sources
+        .iter()
+        .filter(|s| !Path::new(s).exists())
+        .map(String::as_str)
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "checked-in Java worker sources are missing:\n{}",
+        missing.join("\n")
+    );
     let tmp = tempfile::tempdir().unwrap();
     let out = tmp.path().join("out");
     std::fs::create_dir_all(&out).unwrap();

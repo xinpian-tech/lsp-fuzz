@@ -38,6 +38,7 @@ pub mod jvm;
 pub mod jvm_executor;
 pub mod responses;
 pub mod sanitizers;
+pub mod scala_profile;
 mod test;
 pub mod workspace_observer;
 

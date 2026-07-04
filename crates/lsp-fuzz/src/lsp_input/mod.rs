@@ -22,6 +22,7 @@ use messages::LspMessageSequence;
 use serde::{Deserialize, Serialize};
 
 use crate::{
+    execution::scala_profile::ScalaExecutionProfile,
     execution::workspace_observer::HasWorkspace,
     file_system::{FileSystemDirectory, FileSystemEntry},
     lsp,
@@ -223,17 +224,21 @@ impl ToTargetBytes<LspInput> for LspInputBytesConverter {
 /// the source files, and emits a self-describing envelope the worker parses:
 ///
 /// ```text
-/// <u32-le rootUriLen><rootUri utf8><localized framed JSON-RPC stream>
+/// <u32-le n><rootUri>  <u32-le n><initializeParams JSON>  <u32-le n><allowed methods, \n-separated>
+/// <localized framed JSON-RPC stream>
 /// ```
 ///
-/// The stream is the same localized `initialize … exit` message sequence
-/// [`LspInput::request_bytes`] produces (virtual `lsp-fuzz://` URIs rewritten to the materialized
-/// `file://` workspace). The worker owns `initialize`/`initialized`/`shutdown`/`exit` at epoch scope
-/// and replays the per-input `didOpen`s and stored messages from the same stream, so mutating
-/// `input.messages` or `input.workspace` changes exactly what the real server executes.
+/// The `initialize` params + method allowlist come from the [`ScalaExecutionProfile`], so the worker
+/// initializes and gates the server exactly as the profile prescribes. The stream is the same
+/// localized `initialize … exit` message sequence [`LspInput::request_bytes`] produces (virtual
+/// `lsp-fuzz://` URIs rewritten to the materialized `file://` workspace); the worker owns lifecycle
+/// (`initialize`/`initialized`/`shutdown`/`exit`) and replays the per-input `didOpen`s and stored
+/// messages from that stream, so mutating `input.messages`/`input.workspace` changes exactly what the
+/// real server executes.
 #[derive(Debug, New)]
 pub struct JvmLspInputConverter {
     workspace_root: PathBuf,
+    profile: ScalaExecutionProfile,
 }
 
 impl ToTargetBytes<LspInput> for JvmLspInputConverter {
@@ -265,15 +270,26 @@ impl ToTargetBytes<LspInput> for JvmLspInputConverter {
         let root_uri = uri::workspace_uri(&self.workspace_root)
             .map(|path| format!("file://{path}"))
             .unwrap_or_default();
+        let init_params = self.profile.initialize_params(&root_uri).to_string();
+        let allowed_methods = self.profile.allowed_methods().join("\n");
         let stream = input.request_bytes(&workspace_dir);
 
-        let root_len = u32::try_from(root_uri.len()).unwrap_or(0);
-        let mut envelope = Vec::with_capacity(4 + root_uri.len() + stream.len());
-        envelope.extend_from_slice(&root_len.to_le_bytes());
-        envelope.extend_from_slice(root_uri.as_bytes());
+        let mut envelope = Vec::with_capacity(
+            12 + root_uri.len() + init_params.len() + allowed_methods.len() + stream.len(),
+        );
+        push_length_prefixed(&mut envelope, root_uri.as_bytes());
+        push_length_prefixed(&mut envelope, init_params.as_bytes());
+        push_length_prefixed(&mut envelope, allowed_methods.as_bytes());
         envelope.extend_from_slice(&stream);
         envelope.into()
     }
+}
+
+/// Append `<u32-le len><bytes>` to `out`.
+fn push_length_prefixed(out: &mut Vec<u8>, bytes: &[u8]) {
+    let len = u32::try_from(bytes.len()).unwrap_or(0);
+    out.extend_from_slice(&len.to_le_bytes());
+    out.extend_from_slice(bytes);
 }
 
 impl HasWorkspace for LspInput {
@@ -434,5 +450,92 @@ mod tests {
 
         // Then the original URI is returned unchanged
         assert_eq!(lifted.as_str(), "file:///other/path");
+    }
+
+    /// Read a `<u32-le len><bytes>` section at `*pos`, advancing `*pos`.
+    fn read_section<'a>(payload: &'a [u8], pos: &mut usize) -> &'a [u8] {
+        let len = u32::from_le_bytes(payload[*pos..*pos + 4].try_into().unwrap()) as usize;
+        let start = *pos + 4;
+        *pos = start + len;
+        &payload[start..start + len]
+    }
+
+    fn scala_input() -> LspInput {
+        use crate::utf8::Utf8Input;
+        let mut doc = TextDocument::new(Language::Scala, "object A:\n  def x = 1\n".into());
+        doc.update_metadata();
+        let workspace = FileSystemDirectory::from([(
+            Utf8Input::new("main.scala".to_owned()),
+            FileSystemEntry::File(WorkspaceEntry::SourceFile(doc)),
+        )]);
+        LspInput {
+            messages: LspMessageSequence::default(),
+            workspace,
+        }
+    }
+
+    #[test]
+    fn jvm_envelope_carries_profile_root_params_and_allowlist() {
+        use crate::execution::scala_profile::ScalaExecutionProfile;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let input = scala_input();
+
+        // Presentation-compiler profile.
+        let mut pc = JvmLspInputConverter::new(
+            tmp.path().to_path_buf(),
+            ScalaExecutionProfile::presentation_compiler(),
+        );
+        let bytes = pc.to_target_bytes(&input);
+        let mut pos = 0;
+        let root_uri = std::str::from_utf8(read_section(&bytes, &mut pos)).unwrap();
+        let init_params = std::str::from_utf8(read_section(&bytes, &mut pos)).unwrap();
+        let allowed = std::str::from_utf8(read_section(&bytes, &mut pos)).unwrap();
+
+        assert!(root_uri.starts_with("file://") && root_uri.contains(tmp.path().to_str().unwrap()));
+        assert!(
+            init_params.contains(root_uri),
+            "initialize params must carry the root"
+        );
+        assert!(
+            init_params.contains("completion"),
+            "PC capabilities declare completion"
+        );
+        assert!(allowed.lines().any(|m| m == "textDocument/completion"));
+        assert!(allowed.lines().any(|m| m == "textDocument/hover"));
+        assert!(!allowed.lines().any(|m| m == "textDocument/references"));
+        // The stream (initialize .. exit frames) follows the three sections.
+        assert!(
+            pos < bytes.len(),
+            "the framed LSP stream must follow the header sections"
+        );
+
+        // Index profile: the allowlist differs (references / workspace-symbol enabled).
+        let mut index =
+            JvmLspInputConverter::new(tmp.path().to_path_buf(), ScalaExecutionProfile::index());
+        let bytes = index.to_target_bytes(&input);
+        let mut pos = 0;
+        let _root = read_section(&bytes, &mut pos);
+        let _params = read_section(&bytes, &mut pos);
+        let allowed = std::str::from_utf8(read_section(&bytes, &mut pos)).unwrap();
+        assert!(allowed.lines().any(|m| m == "textDocument/references"));
+        assert!(allowed.lines().any(|m| m == "workspace/symbol"));
+        assert!(!allowed.lines().any(|m| m == "textDocument/completion"));
+    }
+
+    #[test]
+    fn native_converter_is_unchanged_by_the_profile() {
+        // The generic native path must stay profile-free: `request_bytes` bytes for the same input
+        // do not depend on any Scala profile.
+        let tmp = tempfile::tempdir().unwrap();
+        let input = scala_input();
+        let hash = input.workspace_hash();
+        let dir = tmp
+            .path()
+            .join(format!("{}{hash}", LspInput::WORKSPACE_DIR_PREFIX));
+        let native = input.request_bytes(&dir);
+        let mut converter = LspInputBytesConverter::new(tmp.path().to_path_buf());
+        let via_converter = converter.to_target_bytes(&input);
+        assert_eq!(&*via_converter, native.as_slice());
     }
 }

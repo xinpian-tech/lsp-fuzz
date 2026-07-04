@@ -946,9 +946,7 @@ mod tests {
             format!("{agent}/fixture/Target.java"),
             format!("{agent}/fixture/LateWriteFixture.java"),
         ];
-        if !sources.iter().all(|s| std::path::Path::new(s).exists()) {
-            return; // sources not laid out as expected: skip
-        }
+        assert_sources_present(&sources);
         let out = tempfile::tempdir().unwrap();
         let compiled = Command::new("javac")
             .arg("-d")
@@ -1012,9 +1010,7 @@ mod tests {
             format!("{agent}/fixture/Target.java"),
             format!("{agent}/fixture/LateWriteFixture.java"),
         ];
-        if !sources.iter().all(|s| std::path::Path::new(s).exists()) {
-            return; // sources not laid out as expected: skip
-        }
+        assert_sources_present(&sources);
         let out = tempfile::tempdir().unwrap();
         let compiled = Command::new("javac")
             .arg("-d")
@@ -1105,6 +1101,21 @@ mod tests {
         );
     }
 
+    /// Panic (not skip) when a checked-in Java source is missing: that is a source-list/repository
+    /// regression, not an unavailable external toolchain. Lists every missing path.
+    fn assert_sources_present(sources: &[String]) {
+        let missing: Vec<&str> = sources
+            .iter()
+            .filter(|s| !std::path::Path::new(s).exists())
+            .map(String::as_str)
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "checked-in Java worker sources are missing (source-list regression):\n{}",
+            missing.join("\n")
+        );
+    }
+
     /// The LS's exact pinned JDK, derived from its launcher wrapper (its FFM `SQLite` binding
     /// segfaults on a foreign JDK build). Returns the `.../bin/java` under the jar's package root.
     fn pinned_java_from_wrapper(ls_jar: &std::path::Path) -> Option<std::path::PathBuf> {
@@ -1171,9 +1182,7 @@ mod tests {
             format!("{agent}/fixture/Target.java"),
             format!("{agent}/fixture/LateWriteFixture.java"),
         ];
-        if !sources.iter().all(|s| std::path::Path::new(s).exists()) {
-            return;
-        }
+        assert_sources_present(&sources);
         let out = tempfile::tempdir().unwrap();
         let compiled = Command::new(&javac)
             .arg("-d")
@@ -1225,7 +1234,10 @@ mod tests {
         // Build the worker payloads from REAL fuzzer inputs, exactly as JVM-mode fuzzing does: the
         // converter materializes each input's workspace, localizes its URIs, and frames its stored
         // LSP message sequence into the envelope the worker replays against the real server.
-        let mut converter = crate::lsp_input::JvmLspInputConverter::new(out.path().to_path_buf());
+        let mut converter = crate::lsp_input::JvmLspInputConverter::new(
+            out.path().to_path_buf(),
+            crate::execution::scala_profile::ScalaExecutionProfile::presentation_compiler(),
+        );
 
         // Input 1: a two-file workspace and two stored request kinds (hover + completion), so the
         // real server opens both documents and executes both requests.

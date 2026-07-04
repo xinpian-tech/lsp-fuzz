@@ -37,10 +37,11 @@ public final class LsIterationBody implements IterationBody {
     private static final long REQUEST_TIMEOUT_MS = 30_000;
 
     private boolean started;
-    private boolean initializeSent;
     private boolean initializedSent;
     private Object endpoint; // org.eclipse.lsp4j.jsonrpc.RemoteEndpoint (implements Endpoint)
     private final List<String> openDocuments = new ArrayList<>();
+    // The profile's method allowlist for the current input; a stored message outside it is dropped.
+    private java.util.Set<String> allowedMethods = java.util.Set.of();
     // Request methods forwarded and completed during the current input, published to
     // $COV_REQUESTS_PATH so a test can prove the exact stored requests actually executed.
     private final List<String> completedRequests = new ArrayList<>();
@@ -59,10 +60,12 @@ public final class LsIterationBody implements IterationBody {
         ensureStarted();
         Envelope env = Envelope.parse(payload);
         completedRequests.clear();
+        allowedMethods = env.allowedMethods;
         try {
-            // Initialize the epoch once against the stable root the envelope carries, so every
-            // input's documents are opened under the initialized workspace root.
-            ensureInitialized(env.rootUri);
+            // Initialize the epoch once with the profile-supplied params (rooted at the stable root
+            // the envelope carries), so every input's documents are opened under the initialized
+            // workspace root and the server is configured exactly as the profile prescribes.
+            ensureInitialized(env.initializeParams);
 
             // Per-input document reset: close everything the previous input opened.
             for (String uri : openDocuments) {
@@ -83,52 +86,51 @@ public final class LsIterationBody implements IterationBody {
     }
 
     /**
-     * Send {@code initialize} + {@code initialized} exactly once per epoch, built from the stable
-     * root the converter put in the envelope (not the per-input stream frame). Bootstrap degrades
-     * gracefully without a BSP/index connection.
+     * Send {@code initialize} + {@code initialized} exactly once per epoch, using the
+     * profile-supplied params the envelope carries (rooted at the stable workspace root). Bootstrap
+     * degrades gracefully without a BSP/index connection.
      */
-    private void ensureInitialized(String rootUri) throws Exception {
+    private void ensureInitialized(String initializeParams) throws Exception {
         if (initializedSent) {
             return;
         }
-        String initParams = "{\"processId\":null,\"rootUri\":" + quote(rootUri)
-                + ",\"workspaceFolders\":[{\"uri\":" + quote(rootUri) + ",\"name\":\"lsp-fuzz\"}]"
-                + ",\"capabilities\":{}}";
-        Object future = endpointRequest.invoke(endpoint, "initialize", json(initParams));
+        Object future = endpointRequest.invoke(endpoint, "initialize", json(initializeParams));
         ((CompletableFuture<?>) future).get(REQUEST_TIMEOUT_MS, TimeUnit.MILLISECONDS);
-        initializeSent = true;
         notifyServer("initialized", json("{}"));
         initializedSent = true;
     }
 
-    /** Forward one JSON-RPC frame, owning the server lifecycle and tracking request futures. */
+    /** Forward one JSON-RPC frame, owning the server lifecycle and enforcing the profile allowlist. */
     private void dispatch(String body) throws Exception {
         Object obj = asJsonObject.invoke(jsonParse.invoke(null, body));
         String method = optString(obj, "method");
         if (method == null) {
             return; // a response echoed into the stream (there are none here): ignore
         }
-        Object params = has(obj, "params") ? get(obj, "params") : null;
-        boolean isRequest = has(obj, "id");
-
         switch (method) {
             case "initialize", "initialized", "shutdown", "exit" -> {
                 // Lifecycle is owned per epoch (see ensureInitialized); never replay it per input.
-            }
-            case "textDocument/didOpen" -> {
-                notifyServer(method, params);
-                String uri = documentUri(params);
-                if (uri != null) {
-                    openDocuments.add(uri);
-                }
+                return;
             }
             default -> {
-                if (isRequest) {
-                    requestAndWait(method, params);
-                } else {
-                    notifyServer(method, params);
+                // Enforce the profile's method allowlist: a stored message outside it is dropped.
+                if (!allowedMethods.isEmpty() && !allowedMethods.contains(method)) {
+                    return;
                 }
             }
+        }
+        Object params = has(obj, "params") ? get(obj, "params") : null;
+        boolean isRequest = has(obj, "id");
+        if ("textDocument/didOpen".equals(method)) {
+            notifyServer(method, params);
+            String uri = documentUri(params);
+            if (uri != null) {
+                openDocuments.add(uri);
+            }
+        } else if (isRequest) {
+            requestAndWait(method, params);
+        } else {
+            notifyServer(method, params);
         }
     }
 
@@ -282,20 +284,31 @@ public final class LsIterationBody implements IterationBody {
         return sb.append('"').toString();
     }
 
-    /** The worker envelope: a localized workspace root plus the framed JSON-RPC message stream. */
-    private record Envelope(String rootUri, List<byte[]> frames) {
+    /**
+     * The worker envelope: three length-prefixed sections (workspace root, profile initialize
+     * params, method allowlist) followed by the framed JSON-RPC message stream.
+     */
+    private record Envelope(String rootUri, String initializeParams,
+            java.util.Set<String> allowedMethods, List<byte[]> frames) {
         static Envelope parse(byte[] payload) {
-            int rootLen = (payload[0] & 0xff) | (payload[1] & 0xff) << 8
-                    | (payload[2] & 0xff) << 16 | (payload[3] & 0xff) << 24;
-            String rootUri = new String(payload, 4, rootLen, StandardCharsets.UTF_8);
-            int pos = 4 + rootLen;
+            int[] pos = {0};
+            String rootUri = new String(section(payload, pos), StandardCharsets.UTF_8);
+            String initializeParams = new String(section(payload, pos), StandardCharsets.UTF_8);
+            String allowed = new String(section(payload, pos), StandardCharsets.UTF_8);
+            java.util.Set<String> allowedMethods = new java.util.HashSet<>();
+            for (String m : allowed.split("\n")) {
+                if (!m.isBlank()) {
+                    allowedMethods.add(m.trim());
+                }
+            }
             List<byte[]> frames = new ArrayList<>();
-            while (pos < payload.length) {
-                int headerEnd = indexOf(payload, pos);
+            int p = pos[0];
+            while (p < payload.length) {
+                int headerEnd = indexOf(payload, p);
                 if (headerEnd < 0) {
                     break;
                 }
-                String headers = new String(payload, pos, headerEnd - pos, StandardCharsets.ISO_8859_1);
+                String headers = new String(payload, p, headerEnd - p, StandardCharsets.ISO_8859_1);
                 int len = contentLength(headers);
                 int bodyStart = headerEnd + 4;
                 if (len < 0 || bodyStart + len > payload.length) {
@@ -304,9 +317,20 @@ public final class LsIterationBody implements IterationBody {
                 byte[] body = new byte[len];
                 System.arraycopy(payload, bodyStart, body, 0, len);
                 frames.add(body);
-                pos = bodyStart + len;
+                p = bodyStart + len;
             }
-            return new Envelope(rootUri, frames);
+            return new Envelope(rootUri, initializeParams, allowedMethods, frames);
+        }
+
+        /** Read one `<u32-le len><bytes>` section starting at {@code pos[0]}, advancing {@code pos[0]}. */
+        private static byte[] section(byte[] payload, int[] pos) {
+            int at = pos[0];
+            int len = (payload[at] & 0xff) | (payload[at + 1] & 0xff) << 8
+                    | (payload[at + 2] & 0xff) << 16 | (payload[at + 3] & 0xff) << 24;
+            byte[] bytes = new byte[len];
+            System.arraycopy(payload, at + 4, bytes, 0, len);
+            pos[0] = at + 4 + len;
+            return bytes;
         }
 
         private static int indexOf(byte[] data, int from) {

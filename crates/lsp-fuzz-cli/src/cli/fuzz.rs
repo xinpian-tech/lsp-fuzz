@@ -114,6 +114,11 @@ pub(super) struct FuzzCommand {
     /// `--lsp-executable` are skipped; each token is preserved as a separate argv entry.
     #[clap(long, num_args = 1.., allow_hyphen_values = true)]
     jvm_worker: Vec<String>,
+
+    /// The Scala execution profile régime for JVM mode: `pc` (presentation compiler, the default) or
+    /// `index` (BSP-backed index paths; requires the pinned native `SQLite` and a backdrop).
+    #[clap(long, value_enum, default_value_t)]
+    scala_regime: lsp_fuzz::execution::scala_profile::ScalaRegime,
 }
 
 impl FuzzCommand {
@@ -312,6 +317,10 @@ impl FuzzCommand {
     /// Fuzz a JVM language-server target through the persistent coverage worker. No native ELF/AFL
     /// binary inspection: coverage comes from the worker's mmap map surfaced through
     /// [`JvmLspExecutor`], and crashes are the fuzzing objective.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "single method for LibAFL type inference"
+    )]
     fn run_jvm_mode(self, global_options: GlobalOptions) -> Result<(), anyhow::Error> {
         let (program, args) = self
             .jvm_worker
@@ -319,6 +328,16 @@ impl FuzzCommand {
             .context("--jvm-worker must name a worker program")?;
         let program = program.clone();
         let args = args.to_vec();
+
+        // The Scala execution profile isolates the language-server régime (init params, capabilities,
+        // per-régime method allowlist). Index mode needs its native SQLite/backdrop environment.
+        let profile = lsp_fuzz::execution::scala_profile::ScalaExecutionProfile::for_regime(
+            self.scala_regime,
+        );
+        profile
+            .validate_environment()
+            .map_err(|e| anyhow::anyhow!(e))
+            .context("The requested Scala régime is missing required environment")?;
 
         let grammar_ctx =
             load_grammar_lookup(&self.language_fragments).context("Creating grammar context")?;
@@ -365,7 +384,7 @@ impl FuzzCommand {
 
         let mut fuzzer = StdFuzzerBuilder::new()
             .input_filter(NopInputFilter)
-            .target_bytes_converter(JvmLspInputConverter::new(temp_dir))
+            .target_bytes_converter(JvmLspInputConverter::new(temp_dir, profile))
             .scheduler(QueueScheduler::new())
             .feedback(feedback)
             .objective(objective)
