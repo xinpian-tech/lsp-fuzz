@@ -37,6 +37,12 @@ pub struct ColdReplayCommand {
     /// Where to write the updated bundle (with its confirmed replayability), if set.
     #[clap(long, short)]
     output: Option<PathBuf>,
+
+    /// Total replay deadline in milliseconds, overriding the bundle's recorded per-input run budget.
+    /// A cold replay boots a fresh JVM and bootstraps the server's index from scratch, which takes far
+    /// longer than the warm in-process worker's per-input budget, so a generous value is usually needed.
+    #[clap(long)]
+    timeout_ms: Option<u64>,
 }
 
 /// Load a finding bundle from `path` and revalidate its provenance, rejecting a bundle whose required
@@ -92,7 +98,11 @@ impl ColdReplayCommand {
             ],
             temp_root: temp_dir,
             backdrop_root: self.backdrop_root.clone(),
-            timeout: Duration::from_millis(bundle.provenance.run_timeout_ms.max(1)),
+            timeout: Duration::from_millis(
+                self.timeout_ms
+                    .unwrap_or(bundle.provenance.run_timeout_ms)
+                    .max(1),
+            ),
         };
 
         info!(

@@ -18,8 +18,9 @@ use std::{
     borrow::Cow,
     io::{self, Cursor, Read, Write},
     path::{Path, PathBuf},
-    process::{Command, Stdio},
-    sync::mpsc::{RecvTimeoutError, channel},
+    process::{ChildStderr, ChildStdout, Command, Stdio},
+    sync::mpsc::{RecvTimeoutError, Sender, channel},
+    thread::JoinHandle,
     time::Duration,
 };
 
@@ -41,7 +42,7 @@ use crate::execution::jvm_executor::JvmOutcomeObserver;
 use crate::execution::outcome::OutcomeClass;
 use crate::execution::scala_profile::{ScalaExecutionProfile, ScalaProfileMode};
 use crate::findings::{FindingSet, findings_from_json_rpc_errors};
-use crate::lsp::json_rpc::JsonRPCMessage;
+use crate::lsp::json_rpc::{JsonRPCMessage, MessageId};
 use crate::lsp_input::LspInput;
 use crate::lsp_input::materializer::{
     BackdropOverlayMaterializer, GenericTempRootMaterializer, WorkspaceMaterializer,
@@ -431,11 +432,83 @@ fn has_fatal_log(stderr: &str) -> bool {
 /// Upper bound on captured stderr, so a chatty shipped entrypoint cannot exhaust the driver's memory.
 const STDERR_CAPTURE_CAP: usize = 64 * 1024;
 
+/// Read the entrypoint's stdout to EOF, sending the full byte buffer on `out_tx` at the end. While
+/// reading, once the response to `last_request_id` (if any) is seen, signal `resp_tx` so the writer
+/// may send the teardown — the last sequential request replying implies the earlier ones did too.
+fn spawn_response_reader(
+    mut stdout: ChildStdout,
+    last_request_id: Option<usize>,
+    resp_tx: Sender<()>,
+    out_tx: Sender<Vec<u8>>,
+) -> JoinHandle<()> {
+    std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let mut chunk = [0u8; 8192];
+        let mut signalled = false;
+        loop {
+            match stdout.read(&mut chunk) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    buf.extend_from_slice(&chunk[..n]);
+                    if !signalled
+                        && let Some(id) = last_request_id
+                        && response_seen(&buf, id)
+                    {
+                        signalled = true;
+                        let _ = resp_tx.send(());
+                    }
+                }
+            }
+        }
+        let _ = out_tx.send(buf);
+    })
+}
+
+/// Read the entrypoint's stderr to EOF, returning at most [`STDERR_CAPTURE_CAP`] retained bytes (but
+/// still draining the rest so a chatty process can neither exhaust memory nor block on a full pipe).
+/// While reading, once the [`LS_BOOTSTRAP_READY_MARKER`] appears, signal `ready_tx` so the writer may
+/// send the requests. A bounded rolling window keeps a marker split across reads detectable.
+fn spawn_stderr_reader(mut stderr: ChildStderr, ready_tx: Sender<()>) -> JoinHandle<String> {
+    std::thread::spawn(move || {
+        let mut retained = Vec::new();
+        let mut window = Vec::new();
+        let mut chunk = [0u8; 8192];
+        let mut signalled = false;
+        loop {
+            match stderr.read(&mut chunk) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    if retained.len() < STDERR_CAPTURE_CAP {
+                        let room = STDERR_CAPTURE_CAP - retained.len();
+                        retained.extend_from_slice(&chunk[..n.min(room)]);
+                    }
+                    if !signalled {
+                        window.extend_from_slice(&chunk[..n]);
+                        if String::from_utf8_lossy(&window).contains(LS_BOOTSTRAP_READY_MARKER) {
+                            signalled = true;
+                            let _ = ready_tx.send(());
+                            window = Vec::new();
+                        } else {
+                            let keep = LS_BOOTSTRAP_READY_MARKER.len().saturating_sub(1);
+                            if window.len() > keep {
+                                window.drain(..window.len() - keep);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        String::from_utf8_lossy(&retained).into_owned()
+    })
+}
+
 /// Cold-replay `input` through the shipped `ls.core.Main` stdio entrypoint, using the SAME
 /// materializer + initialize surface as the JVM fuzzing path: `pc` mode materializes under a temp
 /// root and initializes there; `index` mode overlays the verified frozen backdrop and initializes at
-/// the backdrop root, and response URIs lift frozen-source paths exactly like the fuzzing path.
-/// Bounded by the config's timeout.
+/// the backdrop root, and response URIs lift frozen-source paths exactly like the fuzzing path. The
+/// writes are staged behind a bootstrap-readiness barrier and a response barrier (see [`cold_replay`]'s
+/// body) so the replay faithfully reproduces the warm in-process worker's surface. Bounded by the
+/// config's timeout.
 ///
 /// # Errors
 ///
@@ -457,7 +530,7 @@ pub fn cold_replay(
         }
     };
     let placed = materializer.materialize(input)?;
-    let stream = build_cold_replay_stream(
+    let frames = build_cold_replay_frames(
         input,
         config.profile,
         &placed.root_uri,
@@ -474,48 +547,48 @@ pub fn cold_replay(
         .stdin
         .take()
         .ok_or_else(|| io::Error::other("no stdin"))?;
-    let mut stdout = child
+    let stdout = child
         .stdout
         .take()
         .ok_or_else(|| io::Error::other("no stdout"))?;
-    let mut stderr = child
+    let stderr = child
         .stderr
         .take()
         .ok_or_else(|| io::Error::other("no stderr"))?;
 
-    // Write the full request stream on a thread (it may exceed the pipe buffer) and read stdout and
-    // stderr each to EOF on their own threads, so no direction can deadlock the caller.
+    // Drive the writes with two barriers that mirror the in-process worker's steady state:
+    //   1. write `initialize` + `initialized`, WAIT for bootstrap readiness (LS_BOOTSTRAP_READY_MARKER
+    //      on stderr) — firing everything at once races the async bootstrap and gets a spurious
+    //      `-32803 "workspace is not ready"` instead of the genuine per-request outcome;
+    //   2. write the requests, WAIT for the last request's response, THEN write `shutdown`/`exit` —
+    //      tearing the server down before a slow request replies would drop its response (and finding).
+    // Both waits are bounded by the deadline so a broken/hung server can never hang the writer.
+    let (ready_tx, ready_rx) = channel::<()>();
+    let (resp_tx, resp_rx) = channel::<()>();
+    let deadline = config.timeout;
+    let ColdReplayFrames {
+        handshake,
+        requests,
+        teardown,
+        last_request_id,
+    } = frames;
     let writer = std::thread::spawn(move || {
-        let _ = stdin.write_all(&stream);
+        let _ = stdin.write_all(&handshake);
+        let _ = stdin.flush();
+        let _ = ready_rx.recv_timeout(deadline);
+        let _ = stdin.write_all(&requests);
+        let _ = stdin.flush();
+        // Wait for the last request's response before tearing down (only if a request was sent).
+        if last_request_id.is_some() {
+            let _ = resp_rx.recv_timeout(deadline);
+        }
+        let _ = stdin.write_all(&teardown);
         let _ = stdin.flush();
         drop(stdin); // signal end-of-input
     });
     let (tx, rx) = channel();
-    let reader = std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        let _ = stdout.read_to_end(&mut buf);
-        let _ = tx.send(buf);
-    });
-    // Stderr is genuinely bounded: retain at most STDERR_CAPTURE_CAP bytes but keep reading (and
-    // discarding) to EOF, so a chatty process can neither exhaust the driver's memory nor block on a
-    // full stderr pipe. Classification runs on the retained prefix.
-    let err_reader = std::thread::spawn(move || {
-        let mut retained = Vec::new();
-        let mut chunk = [0u8; 8192];
-        loop {
-            match stderr.read(&mut chunk) {
-                Ok(0) | Err(_) => break,
-                Ok(n) => {
-                    if retained.len() < STDERR_CAPTURE_CAP {
-                        let room = STDERR_CAPTURE_CAP - retained.len();
-                        retained.extend_from_slice(&chunk[..n.min(room)]);
-                    }
-                    // Bytes beyond the cap are drained and dropped so the child never blocks.
-                }
-            }
-        }
-        String::from_utf8_lossy(&retained).into_owned()
-    });
+    let reader = spawn_response_reader(stdout, last_request_id, resp_tx, tx);
+    let err_reader = spawn_stderr_reader(stderr, ready_tx);
 
     // The server exits on `exit`, closing stdout and completing the read; if it hangs, the deadline
     // fires and we kill it (which closes the pipe and ends the reader threads).
@@ -564,50 +637,112 @@ fn is_replayed(method: &str, profile: &ScalaExecutionProfile) -> bool {
     !LIFECYCLE_METHODS.contains(&method) && profile.allowed_methods().contains(&method)
 }
 
-/// Build the framed JSON-RPC stream for a cold replay so it drives the SAME message surface the JVM
-/// fuzzing path does: the profile's `initialize` params (rooted at the materialized `root_uri`) +
-/// `initialized`, then the input's `didOpen`s and stored messages that pass the profile method
-/// allowlist (localized to `localization_dir`), then a final `shutdown`/`exit` to terminate the
-/// entrypoint. Lifecycle from the input stream is never replayed, and a disallowed stored message is
-/// dropped exactly as the in-process worker drops it — so cold replay never sends a request the
-/// fuzzer would not have. The sent-request id numbering matches [`cold_replay_stored_messages`]
-/// (the profile initialize consumes id 0; the first sent stored request is id 1), so the responses
-/// line up with [`RequestResponseMatching`].
+/// The full cold-replay stream (handshake + requests + teardown concatenated), used by tests that
+/// assert the ordered method surface and id numbering. The live path writes the three parts with a
+/// bootstrap-readiness barrier and a response barrier between them (see [`build_cold_replay_frames`]
+/// and [`cold_replay`]).
+#[cfg(test)]
 fn build_cold_replay_stream(
     input: &LspInput,
     profile: &ScalaExecutionProfile,
     root_uri: &str,
     localization_dir: &Path,
 ) -> Vec<u8> {
+    let frames = build_cold_replay_frames(input, profile, root_uri, localization_dir);
+    [frames.handshake, frames.requests, frames.teardown].concat()
+}
+
+/// The id of the profile-supplied `initialize` request cold replay sends (the worker's initialize is
+/// likewise id 0). The first sent stored request is id 1, matching [`RequestResponseMatching`].
+const COLD_REPLAY_INITIALIZE_ID: usize = 0;
+
+/// The log line the shipped LS prints (to stderr) once its BSP/index bootstrap has finished and it
+/// will serve real per-request outcomes. This is the readiness gate a compliant client waits on after
+/// `initialized` and before any query — until it appears, a request is rejected with a spurious
+/// `-32803 "workspace is not ready: waiting for the initialized notification"` rather than the genuine
+/// outcome, so cold replay MUST wait for it too or it would never match a real finding produced by the
+/// (warm, long-since-bootstrapped) in-process worker.
+const LS_BOOTSTRAP_READY_MARKER: &str = "bootstrap finished: ready";
+
+/// The three parts of a cold-replay stream, written with a barrier between each (see [`cold_replay`]).
+struct ColdReplayFrames {
+    /// `initialize` (id 0) + `initialized`, sent first.
+    handshake: Vec<u8>,
+    /// The filtered didOpens + stored requests, sent only after the server signals readiness.
+    requests: Vec<u8>,
+    /// `shutdown` + `exit`, sent only after every stored request has been answered — the in-process
+    /// worker awaits each request's response and never tears the server down mid-request, so tearing
+    /// down before a slow request replies would drop its response and lose the finding.
+    teardown: Vec<u8>,
+    /// The id of the last stored request sent (if any); the driver waits for its response — implying
+    /// the earlier sequential ids have also replied — before sending `teardown`.
+    last_request_id: Option<usize>,
+}
+
+/// Split the cold-replay stream into [`ColdReplayFrames`] so the driver can stage the writes: send the
+/// handshake, WAIT for bootstrap readiness ([`LS_BOOTSTRAP_READY_MARKER`]), send the requests, WAIT for
+/// their responses, then send `shutdown`/`exit`. This reproduces the steady state and the
+/// request-by-request await the persistent in-process worker uses (it emits `initialized` once per
+/// epoch and never sends `shutdown`/`exit` per input). Concatenating the three parts reproduces the
+/// previous single stream byte-for-byte (same ordering, same id numbering: initialize is id 0, the
+/// first sent stored request is id 1), so response matching is unaffected; only write *timing* changes.
+fn build_cold_replay_frames(
+    input: &LspInput,
+    profile: &ScalaExecutionProfile,
+    root_uri: &str,
+    localization_dir: &Path,
+) -> ColdReplayFrames {
     let localize_uri = uri::workspace_uri(localization_dir)
         .map(|p| format!("file://{p}"))
         .unwrap_or_default();
-    let mut framed = Vec::new();
-    let mut id = 0usize;
-    // The profile-supplied initialize (id 0), then initialized.
-    let init =
-        JsonRPCMessage::request(id, "initialize".into(), profile.initialize_params(root_uri));
+    let mut id = COLD_REPLAY_INITIALIZE_ID;
+    // The handshake: the profile-supplied initialize (id 0) + initialized, sent first.
+    let mut handshake =
+        JsonRPCMessage::request(id, "initialize".into(), profile.initialize_params(root_uri))
+            .to_lsp_payload();
     id += 1;
-    framed.extend(init.to_lsp_payload());
-    framed.extend(
+    handshake.extend(
         JsonRPCMessage::notification("initialized".into(), serde_json::json!({})).to_lsp_payload(),
     );
-    // Generated didOpens + stored messages, filtered by the profile allowlist like the worker.
+    // The requests: generated didOpens + stored messages (filtered by the profile allowlist like the
+    // worker). A request carries an id; a notification (e.g. didOpen) does not, so the last request id
+    // is the highest id actually assigned to a request here.
+    let mut requests = Vec::new();
+    let mut last_request_id = None;
     for msg in input.message_sequence() {
         if !is_replayed(msg.method(), profile) {
             continue;
         }
+        let before = id;
         let message = msg.into_json_rpc(&mut id, Some(&localize_uri));
-        framed.extend(message.to_lsp_payload());
+        if matches!(message, JsonRPCMessage::Request { .. }) {
+            // `into_json_rpc` consumed `before` as this request's id and advanced `id`.
+            last_request_id = Some(before);
+        }
+        requests.extend(message.to_lsp_payload());
     }
-    // Terminate the shipped entrypoint gracefully.
-    framed.extend(
-        JsonRPCMessage::request(id, "shutdown".into(), serde_json::Value::Null).to_lsp_payload(),
-    );
-    framed.extend(
+    // The teardown: a graceful shutdown/exit, sent only after the requests have been answered.
+    let mut teardown =
+        JsonRPCMessage::request(id, "shutdown".into(), serde_json::Value::Null).to_lsp_payload();
+    teardown.extend(
         JsonRPCMessage::notification("exit".into(), serde_json::Value::Null).to_lsp_payload(),
     );
-    framed
+    ColdReplayFrames {
+        handshake,
+        requests,
+        teardown,
+        last_request_id,
+    }
+}
+
+/// Whether `bytes` (a stdout prefix) contains a [`JsonRPCMessage::Response`] to request id `id`.
+fn response_seen(bytes: &[u8], id: usize) -> bool {
+    parse_lsp_payloads(bytes).iter().any(|m| {
+        matches!(
+            m,
+            JsonRPCMessage::Response { id: Some(MessageId::Number(rid)), .. } if *rid == id
+        )
+    })
 }
 
 /// The stored input messages that cold replay actually sends (dropping lifecycle + methods outside
@@ -1011,10 +1146,13 @@ mod tests {
     fn replay_script(script: &str, timeout: Duration) -> OutcomeClass {
         let profile = ScalaExecutionProfile::presentation_compiler();
         let temp = tempfile::tempdir().unwrap();
+        // Emit the bootstrap-ready marker first so the handshake barrier releases immediately; the
+        // marker text triggers no classification rule, so it does not affect what the script tests.
+        let script = format!("echo '{LS_BOOTSTRAP_READY_MARKER}' >&2; {script}");
         let config = ColdReplayConfig {
             profile: &profile,
             program: "sh".to_string(),
-            args: vec!["-c".to_string(), script.to_string()],
+            args: vec!["-c".to_string(), script],
             temp_root: temp.path().to_path_buf(),
             backdrop_root: None,
             timeout,
@@ -1172,6 +1310,69 @@ mod tests {
     }
 
     #[test]
+    fn cold_replay_frames_split_handshake_requests_teardown() {
+        // The frames must isolate the handshake (initialize + initialized) from the requests and the
+        // teardown (shutdown + exit), and report the last stored request id so the driver can wait for
+        // its response before tearing the server down.
+        let mut input = LspInput::default();
+        input.messages.push(request("textDocument/references", {
+            let mut p = position_params("lsp-fuzz://a.scala");
+            p["context"] = serde_json::json!({ "includeDeclaration": true });
+            p
+        }));
+        let profile = ScalaExecutionProfile::index();
+        let dir = tempfile::tempdir().unwrap();
+        let frames = build_cold_replay_frames(&input, &profile, "file:///root", dir.path());
+
+        let methods = |bytes: &[u8]| {
+            parse_lsp_payloads(bytes)
+                .iter()
+                .filter_map(|m| match m {
+                    JsonRPCMessage::Request { method, .. }
+                    | JsonRPCMessage::Notification { method, .. } => Some(method.to_string()),
+                    JsonRPCMessage::Response { .. } => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            methods(&frames.handshake),
+            vec!["initialize", "initialized"]
+        );
+        assert_eq!(methods(&frames.requests), vec!["textDocument/references"]);
+        assert_eq!(methods(&frames.teardown), vec!["shutdown", "exit"]);
+        // The first (and only) stored request gets id 1 (initialize consumed id 0).
+        assert_eq!(frames.last_request_id, Some(1));
+    }
+
+    #[test]
+    fn response_seen_matches_only_the_target_id() {
+        let mut bytes = JsonRPCMessage::response(Some(0usize), Some(serde_json::json!({})), None)
+            .to_lsp_payload();
+        bytes.extend(
+            JsonRPCMessage::response(Some(1usize), Some(serde_json::json!({})), None)
+                .to_lsp_payload(),
+        );
+        assert!(response_seen(&bytes, 0));
+        assert!(response_seen(&bytes, 1));
+        assert!(!response_seen(&bytes, 2));
+    }
+
+    #[test]
+    fn cold_replay_frames_report_no_request_when_all_dropped() {
+        // An index-mode input carrying only a pc-only request (completion) has it dropped, so there is
+        // no stored request to await — the driver must tear down immediately (last_request_id = None).
+        let mut input = LspInput::default();
+        input.messages.push(request(
+            "textDocument/completion",
+            position_params("lsp-fuzz://a.scala"),
+        ));
+        let profile = ScalaExecutionProfile::index();
+        let dir = tempfile::tempdir().unwrap();
+        let frames = build_cold_replay_frames(&input, &profile, "file:///root", dir.path());
+        assert_eq!(frames.last_request_id, None);
+    }
+
+    #[test]
     fn cold_replay_stream_ids_line_up_with_matching() {
         // The first sent stored request must get id 1 (the profile initialize is id 0), matching the
         // 1-based numbering RequestResponseMatching uses over the filtered stored list.
@@ -1222,9 +1423,14 @@ mod tests {
         let config = ColdReplayConfig {
             profile: &profile,
             program: "sh".to_string(),
+            // Emit the bootstrap-ready marker first so the handshake barrier releases and the full
+            // stream is written, then capture everything the entrypoint would receive.
             args: vec![
                 "-c".to_string(),
-                format!("cat > {} ; exit 0", capture.display()),
+                format!(
+                    "echo '{LS_BOOTSTRAP_READY_MARKER}' >&2; cat > {} ; exit 0",
+                    capture.display()
+                ),
             ],
             temp_root: tempfile::tempdir().unwrap().path().to_path_buf(),
             backdrop_root: Some(backdrop.path().to_path_buf()),
