@@ -39,12 +39,15 @@ use tracing::warn;
 
 use crate::execution::jvm_executor::JvmOutcomeObserver;
 use crate::execution::outcome::OutcomeClass;
-use crate::execution::workspace_observer::HasWorkspace;
+use crate::execution::scala_profile::{ScalaExecutionProfile, ScalaProfileMode};
 use crate::findings::{FindingSet, findings_from_json_rpc_errors};
 use crate::lsp::json_rpc::JsonRPCMessage;
 use crate::lsp_input::LspInput;
-use crate::lsp_input::materializer::{GenericTempRootMaterializer, WorkspaceMaterializer};
+use crate::lsp_input::materializer::{
+    BackdropOverlayMaterializer, GenericTempRootMaterializer, WorkspaceMaterializer,
+};
 use crate::lsp_input::server_response::matching::RequestResponseMatching;
+use crate::lsp_input::uri;
 
 /// Provenance for a finding: the pinned versions/hashes/flags that make a cold replay reproducible.
 ///
@@ -66,7 +69,7 @@ pub struct Provenance {
     /// The coverage-agent version.
     pub agent_version: Option<String>,
     /// The coverage-agent configuration (include/exclude scope, map size, ...).
-    pub agent_config: String,
+    pub agent_config: Option<String>,
     /// The frozen `zaozi` backdrop commit (index mode).
     pub backdrop_commit: Option<String>,
     /// The location-independent snapshot hash of the frozen backdrop (index mode).
@@ -103,7 +106,7 @@ impl Provenance {
                 .map(|v| v.split_whitespace().map(str::to_string).collect())
                 .unwrap_or_default(),
             agent_version: env("COV_AGENT_VERSION"),
-            agent_config: env("COV_AGENT_CONFIG").unwrap_or_default(),
+            agent_config: env("COV_AGENT_CONFIG"),
             backdrop_commit: env("BACKDROP_COMMIT"),
             backdrop_snapshot_hash: env("BACKDROP_SNAPSHOT_HASH"),
             semanticdb_hash: env("SEMANTICDB_HASH"),
@@ -119,7 +122,13 @@ impl Provenance {
     ///
     /// Returns [`MissingProvenance`] listing every required-but-absent field.
     pub fn validate(&self) -> Result<(), MissingProvenance> {
+        // The known profile modes; an unrecognized mode is rejected (it could otherwise silently
+        // bypass the index-mode requirements).
+        let mode_known = matches!(self.scala_profile_mode.as_str(), "pc" | "index");
         let mut missing = Vec::new();
+        if !mode_known {
+            missing.push("scala_profile_mode");
+        }
         if self.ls_commit.is_none() {
             missing.push("ls_commit");
         }
@@ -129,12 +138,26 @@ impl Provenance {
         if self.agent_version.is_none() {
             missing.push("agent_version");
         }
+        // The agent config and the JVM flags must be recorded to reproduce the run; an operator with
+        // no extra flags records the explicit `none` sentinel rather than leaving them empty.
+        if self.agent_config.as_deref().unwrap_or_default().is_empty() {
+            missing.push("agent_config");
+        }
+        if self.jdk_flags.is_empty() {
+            missing.push("jdk_flags");
+        }
         if self.is_index_mode() {
             if self.backdrop_commit.is_none() {
                 missing.push("backdrop_commit");
             }
             if self.backdrop_snapshot_hash.is_none() {
                 missing.push("backdrop_snapshot_hash");
+            }
+            if self.semanticdb_hash.is_none() {
+                missing.push("semanticdb_hash");
+            }
+            if self.bsp_hash.is_none() {
+                missing.push("bsp_hash");
             }
             if self.sqlite_artifact_hash.is_none() {
                 missing.push("sqlite_artifact_hash");
@@ -217,22 +240,43 @@ impl FindingBundle {
         Ok(buf)
     }
 
-    /// Write the bundle to `dir` as a CBOR file named by its input hash + outcome class. Returns the
-    /// written path.
+    /// Write the bundle to `dir` as a CBOR file named by its outcome class + a hash of the WHOLE
+    /// input (workspace *and* message sequence, so two findings that differ only in their messages
+    /// get distinct files). Writing is collision-safe: an identical bundle already on disk is left as
+    /// is (idempotent), and a different bundle that hashes to the same base name gets a numeric
+    /// suffix rather than overwriting the earlier finding. Returns the written (or existing) path.
     ///
     /// # Errors
     ///
     /// Returns any I/O or serialization error.
     pub fn write_to(&self, dir: &Path) -> io::Result<PathBuf> {
+        use std::hash::{Hash, Hasher};
         std::fs::create_dir_all(dir)?;
-        let name = format!(
-            "finding_{:?}_{}.cbor",
-            self.outcome_class,
-            self.input.workspace_hash()
-        );
-        let path = dir.join(name);
-        std::fs::write(&path, self.to_cbor()?)?;
-        Ok(path)
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        self.input.hash(&mut hasher);
+        let base = format!("finding_{:?}_{:016x}", self.outcome_class, hasher.finish());
+        let bytes = self.to_cbor()?;
+
+        let mut suffix = 0u32;
+        loop {
+            let name = if suffix == 0 {
+                format!("{base}.cbor")
+            } else {
+                format!("{base}_{suffix}.cbor")
+            };
+            let path = dir.join(name);
+            match std::fs::read(&path) {
+                // An identical bundle is already recorded — nothing to do (idempotent).
+                Ok(existing) if existing == bytes => return Ok(path),
+                // A different bundle hashed to this name — never overwrite it; try the next suffix.
+                Ok(_) => suffix += 1,
+                // Free slot.
+                Err(_) => {
+                    std::fs::write(&path, &bytes)?;
+                    return Ok(path);
+                }
+            }
+        }
     }
 
     /// Cold-replay this finding through the shipped `ls.core.Main` and, if it reproduces the same
@@ -243,14 +287,8 @@ impl FindingBundle {
     /// # Errors
     ///
     /// Returns any I/O error launching or driving the shipped entrypoint.
-    pub fn confirm_via_cold_replay(
-        &mut self,
-        program: &str,
-        args: &[String],
-        temp_root: &Path,
-        timeout: Duration,
-    ) -> io::Result<bool> {
-        let replay = cold_replay(&self.input, program, args, temp_root, timeout)?;
+    pub fn confirm_via_cold_replay(&mut self, config: &ColdReplayConfig<'_>) -> io::Result<bool> {
+        let replay = cold_replay(&self.input, config)?;
         let confirmed = check_equivalence(self, &replay);
         self.replayability = if confirmed {
             Replayability::Confirmed
@@ -259,6 +297,26 @@ impl FindingBundle {
         };
         Ok(confirmed)
     }
+}
+
+/// How to cold-replay an input through the shipped entrypoint, carrying the SAME execution surface
+/// the JVM fuzzing path uses: the Scala profile (initialize params + mode → materializer selection),
+/// the temp root, and — for `index` mode — the verified frozen backdrop root (so documents overlay
+/// the backdrop and responses lift frozen-source URIs exactly like the fuzzing path).
+#[derive(Debug)]
+pub struct ColdReplayConfig<'a> {
+    /// The Scala execution profile; its mode selects the materializer and supplies initialize params.
+    pub profile: &'a ScalaExecutionProfile,
+    /// The shipped-entrypoint program (the LS's pinned `java`).
+    pub program: String,
+    /// The program arguments (classpath + `ls.core.Main` + native-access flags).
+    pub args: Vec<String>,
+    /// A scratch root for materializing the input's workspace (`pc` mode).
+    pub temp_root: PathBuf,
+    /// The verified frozen backdrop root, required for `index` mode.
+    pub backdrop_root: Option<PathBuf>,
+    /// The overall replay deadline; a server that never replies is a timeout.
+    pub timeout: Duration,
 }
 
 /// What a cold replay through the shipped entrypoint observed.
@@ -286,49 +344,120 @@ pub fn check_equivalence(bundle: &FindingBundle, replay: &ReplayObservation) -> 
         .all(|f| replayed.contains(&f.signature()))
 }
 
-/// Classify a cold replay's raw observations into an [`OutcomeClass`] the way the shipped entrypoint
-/// is judged: a crashed process is a JVM fatal; otherwise a JSON-RPC error response is a JSON-RPC
-/// error finding; no reply at all is a timeout; anything else is a normal success.
-fn classify_replay(
-    crashed: bool,
-    timed_out: bool,
-    findings: &FindingSet,
-    got_reply: bool,
-) -> OutcomeClass {
-    if crashed {
-        OutcomeClass::JvmFatal
-    } else if timed_out || !got_reply {
-        OutcomeClass::TimeoutOrDeadlock
-    } else if !findings.is_empty() {
-        OutcomeClass::JsonRpcError
-    } else {
+/// How the shipped-entrypoint process ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProcessEnd {
+    /// Exited cleanly (status 0).
+    Clean,
+    /// Exited with a non-zero status code (an abnormal termination without a signal).
+    NonZero,
+    /// Killed by a signal (no exit code) — a hard crash (SIGSEGV, ...).
+    Signalled,
+    /// Did not finish within the deadline and was killed by the driver.
+    TimedOut,
+}
+
+/// Classify a cold replay across the FULL outcome oracle from the process end + its stderr + any
+/// JSON-RPC error findings. Stderr/exit evidence (which the shipped entrypoint emits before dying)
+/// distinguishes memory exhaustion, an uncaught foreground/background exception, a logged fatal, and a
+/// hard JVM fatal — so a real server defect is not mislabelled a timeout or left harness-only.
+fn classify_replay(end: ProcessEnd, stderr: &str, findings: &FindingSet) -> OutcomeClass {
+    // A hang is a timeout regardless of what little the process printed.
+    if end == ProcessEnd::TimedOut {
+        return OutcomeClass::TimeoutOrDeadlock;
+    }
+    // Memory exhaustion: the JVM prints the error then dies.
+    if stderr.contains("OutOfMemoryError") || stderr.contains("StackOverflowError") {
+        return OutcomeClass::OutOfMemoryOrStackOverflow;
+    }
+    // An uncaught exception the JVM printed to stderr — foreground (main/request thread) vs background.
+    if let Some(class) = uncaught_exception_class(stderr) {
+        return class;
+    }
+    // A fatal-level log line emitted before exit.
+    if has_fatal_log(stderr) {
+        return OutcomeClass::LoggedFatal;
+    }
+    // Any other abnormal termination (a signal or a non-zero exit with no clearer evidence).
+    if matches!(end, ProcessEnd::Signalled | ProcessEnd::NonZero) {
+        return OutcomeClass::JvmFatal;
+    }
+    // A clean exit: a JSON-RPC error response is a finding, otherwise a normal success.
+    if findings.is_empty() {
         OutcomeClass::NormalSuccess
+    } else {
+        OutcomeClass::JsonRpcError
     }
 }
 
-/// Cold-replay `input` through the shipped `ls.core.Main` stdio entrypoint (`program` + `args`),
-/// materializing its workspace under `temp_root` and localizing its URIs exactly as the fuzzer does,
-/// then observing the outcome. Bounded by `timeout`: a server that never replies is a timeout.
+/// The outcome class for an `Exception in thread "<name>"` line the JVM prints for an uncaught
+/// exception: `main` (or the LSP request loop) is a foreground exception, any other thread is a
+/// background exception. A bare stack trace (`\tat ...`) with no thread header is treated as
+/// foreground. Returns `None` if there is no uncaught-exception evidence.
+fn uncaught_exception_class(stderr: &str) -> Option<OutcomeClass> {
+    const MARKER: &str = "Exception in thread \"";
+    if let Some(start) = stderr.find(MARKER) {
+        let rest = &stderr[start + MARKER.len()..];
+        let thread = rest.split('"').next().unwrap_or_default();
+        return Some(if thread == "main" {
+            OutcomeClass::ForegroundException
+        } else {
+            OutcomeClass::BackgroundException
+        });
+    }
+    // A printed stack trace with no thread header (e.g. `Throwable.printStackTrace`) — foreground.
+    if stderr.contains("\n\tat ") || stderr.starts_with("\tat ") {
+        return Some(OutcomeClass::ForegroundException);
+    }
+    None
+}
+
+/// Whether stderr carries a fatal-level log line (a `FATAL`/`SEVERE` marker).
+fn has_fatal_log(stderr: &str) -> bool {
+    stderr.contains("FATAL") || stderr.contains("SEVERE")
+}
+
+/// Upper bound on captured stderr, so a chatty shipped entrypoint cannot exhaust the driver's memory.
+const STDERR_CAPTURE_CAP: usize = 64 * 1024;
+
+/// Cold-replay `input` through the shipped `ls.core.Main` stdio entrypoint, using the SAME
+/// materializer + initialize surface as the JVM fuzzing path: `pc` mode materializes under a temp
+/// root and initializes there; `index` mode overlays the verified frozen backdrop and initializes at
+/// the backdrop root, and response URIs lift frozen-source paths exactly like the fuzzing path.
+/// Bounded by the config's timeout.
 ///
 /// # Errors
 ///
-/// Returns any I/O error materializing the workspace or launching the entrypoint.
+/// Returns any I/O error materializing the workspace or launching the entrypoint, or an error if
+/// `index` mode is requested without a backdrop root.
 pub fn cold_replay(
     input: &LspInput,
-    program: &str,
-    args: &[String],
-    temp_root: &Path,
-    timeout: Duration,
+    config: &ColdReplayConfig<'_>,
 ) -> io::Result<ReplayObservation> {
-    let materializer = GenericTempRootMaterializer::new(temp_root.to_path_buf());
+    let materializer: Box<dyn WorkspaceMaterializer> = match config.profile.mode() {
+        ScalaProfileMode::PresentationCompiler => {
+            Box::new(GenericTempRootMaterializer::new(config.temp_root.clone()))
+        }
+        ScalaProfileMode::Index => {
+            let root = config.backdrop_root.clone().ok_or_else(|| {
+                io::Error::other("index-mode cold replay requires a verified backdrop root")
+            })?;
+            Box::new(BackdropOverlayMaterializer::new(root))
+        }
+    };
     let placed = materializer.materialize(input)?;
-    let stream = input.request_bytes(&placed.localization_dir);
+    let stream = build_cold_replay_stream(
+        input,
+        config.profile,
+        &placed.root_uri,
+        &placed.localization_dir,
+    );
 
-    let mut child = Command::new(program)
-        .args(args)
+    let mut child = Command::new(&config.program)
+        .args(&config.args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .spawn()?;
     let mut stdin = child
         .stdin
@@ -338,9 +467,13 @@ pub fn cold_replay(
         .stdout
         .take()
         .ok_or_else(|| io::Error::other("no stdout"))?;
+    let mut stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| io::Error::other("no stderr"))?;
 
-    // Write the full request stream on a thread (it may exceed the pipe buffer) and read the reply
-    // stream to EOF on another, so neither direction can deadlock the caller.
+    // Write the full request stream on a thread (it may exceed the pipe buffer) and read stdout and
+    // stderr each to EOF on their own threads, so no direction can deadlock the caller.
     let writer = std::thread::spawn(move || {
         let _ = stdin.write_all(&stream);
         let _ = stdin.flush();
@@ -352,10 +485,19 @@ pub fn cold_replay(
         let _ = stdout.read_to_end(&mut buf);
         let _ = tx.send(buf);
     });
+    // Stderr is bounded (truncated) so a chatty process cannot exhaust memory.
+    let err_reader = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = stderr.read_to_end(&mut buf);
+        if buf.len() > STDERR_CAPTURE_CAP {
+            buf.truncate(STDERR_CAPTURE_CAP);
+        }
+        String::from_utf8_lossy(&buf).into_owned()
+    });
 
     // The server exits on `exit`, closing stdout and completing the read; if it hangs, the deadline
-    // fires and we kill it (which closes the pipe and ends the reader thread).
-    let (received_bytes, timed_out) = match rx.recv_timeout(timeout) {
+    // fires and we kill it (which closes the pipe and ends the reader threads).
+    let (received_bytes, timed_out) = match rx.recv_timeout(config.timeout) {
         Ok(bytes) => (bytes, false),
         Err(RecvTimeoutError::Timeout | RecvTimeoutError::Disconnected) => {
             let _ = child.kill();
@@ -365,17 +507,59 @@ pub fn cold_replay(
     let status = child.wait()?;
     let _ = writer.join();
     let _ = reader.join();
-    // A process killed by a signal (no exit code) crashed; a clean or non-zero exit did not.
-    let crashed = !timed_out && status.code().is_none();
+    let stderr_text = err_reader.join().unwrap_or_default();
+
+    let end = if timed_out {
+        ProcessEnd::TimedOut
+    } else {
+        match status.code() {
+            Some(0) => ProcessEnd::Clean,
+            Some(_) => ProcessEnd::NonZero,
+            None => ProcessEnd::Signalled,
+        }
+    };
 
     let received = parse_lsp_payloads(&received_bytes);
-    let got_reply = !received.is_empty();
-    let findings = replay_findings(input, &received);
-    let outcome_class = classify_replay(crashed, timed_out, &findings, got_reply);
+    let backdrop_root = config.backdrop_root.as_deref().and_then(Path::to_str);
+    let findings = replay_findings(input, &received, backdrop_root);
+    let outcome_class = classify_replay(end, &stderr_text, &findings);
     Ok(ReplayObservation {
         outcome_class,
         findings,
     })
+}
+
+/// Build the framed JSON-RPC stream for a cold replay: the profile's `initialize` params (rooted at
+/// the materialized `root_uri`) + `initialized`, then the input's `didOpen`s and stored messages
+/// (localized to `localization_dir`) + `shutdown`/`exit`. The stored-request id numbering matches the
+/// native path (initialize consumes id 0; the first stored request is id 1), so the responses line up
+/// with [`RequestResponseMatching`].
+fn build_cold_replay_stream(
+    input: &LspInput,
+    profile: &ScalaExecutionProfile,
+    root_uri: &str,
+    localization_dir: &Path,
+) -> Vec<u8> {
+    let localize_uri = uri::workspace_uri(localization_dir)
+        .map(|p| format!("file://{p}"))
+        .unwrap_or_default();
+    let mut framed = Vec::new();
+    let mut id = 0usize;
+    // The profile-supplied initialize (id 0), then initialized.
+    let init =
+        JsonRPCMessage::request(id, "initialize".into(), profile.initialize_params(root_uri));
+    id += 1;
+    framed.extend(init.to_lsp_payload());
+    framed.extend(
+        JsonRPCMessage::notification("initialized".into(), serde_json::json!({})).to_lsp_payload(),
+    );
+    // The rest of the sequence (didOpens, stored messages, shutdown, exit); skip the generic
+    // initialize + initialized the sequence would otherwise start with.
+    for msg in input.message_sequence().skip(2) {
+        let message = msg.into_json_rpc(&mut id, Some(&localize_uri));
+        framed.extend(message.to_lsp_payload());
+    }
+    framed
 }
 
 /// Parse every complete `Content-Length`-framed LSP payload from `bytes` (stopping at the first
@@ -391,8 +575,17 @@ fn parse_lsp_payloads(bytes: &[u8]) -> Vec<JsonRPCMessage> {
 
 /// Derive the JSON-RPC error findings from a replay's received messages, using the same
 /// request/response matching (and the same 1-based stored-request numbering) as the native path.
-fn replay_findings(input: &LspInput, received: &[JsonRPCMessage]) -> FindingSet {
-    match RequestResponseMatching::match_messages(input.messages.iter(), received.iter(), None) {
+/// `backdrop_root` (index mode) scopes frozen-source URI lifting exactly like the fuzzing path.
+fn replay_findings(
+    input: &LspInput,
+    received: &[JsonRPCMessage],
+    backdrop_root: Option<&str>,
+) -> FindingSet {
+    match RequestResponseMatching::match_messages(
+        input.messages.iter(),
+        received.iter(),
+        backdrop_root,
+    ) {
         Ok(matching) => {
             findings_from_json_rpc_errors(matching.errors.iter().map(|(m, e)| (m.method(), e)))
         }
@@ -485,7 +678,7 @@ mod tests {
             ls_classpath_hash: Some("cp-hash".to_string()),
             jdk_flags: vec!["-XX:-UseCompactObjectHeaders".to_string()],
             agent_version: Some("agent-1".to_string()),
-            agent_config: "asm-9.8".to_string(),
+            agent_config: Some("asm-9.8".to_string()),
             backdrop_commit: None,
             backdrop_snapshot_hash: None,
             semanticdb_hash: None,
@@ -499,6 +692,8 @@ mod tests {
             scala_profile_mode: "index".to_string(),
             backdrop_commit: Some("fefb58e9".to_string()),
             backdrop_snapshot_hash: Some("snap-hash".to_string()),
+            semanticdb_hash: Some("sdb-hash".to_string()),
+            bsp_hash: Some("bsp-hash".to_string()),
             sqlite_artifact_hash: Some("sqlite-hash".to_string()),
             ..pc_provenance()
         }
@@ -521,32 +716,80 @@ mod tests {
 
     #[test]
     fn missing_required_provenance_is_rejected() {
-        // A missing always-required field (agent_version) rejects, in pc mode.
+        // Each always-required field rejects when absent, in pc mode.
+        for clear in [
+            "ls_commit",
+            "ls_classpath_hash",
+            "agent_version",
+            "agent_config",
+            "jdk_flags",
+        ] {
+            let mut prov = pc_provenance();
+            match clear {
+                "ls_commit" => prov.ls_commit = None,
+                "ls_classpath_hash" => prov.ls_classpath_hash = None,
+                "agent_version" => prov.agent_version = None,
+                "agent_config" => prov.agent_config = None,
+                "jdk_flags" => prov.jdk_flags.clear(),
+                _ => unreachable!(),
+            }
+            let err = prov.validate().unwrap_err();
+            assert!(err.missing.contains(&clear), "{clear} should be required");
+            assert!(
+                FindingBundle::build(
+                    LspInput::default(),
+                    OutcomeClass::JsonRpcError,
+                    FindingSet::new(),
+                    prov,
+                )
+                .is_err()
+            );
+        }
+
+        // An empty agent_config is treated the same as a missing one.
         let mut prov = pc_provenance();
-        prov.agent_version = None;
-        let err = prov.validate().unwrap_err();
-        assert!(err.missing.contains(&"agent_version"));
+        prov.agent_config = Some(String::new());
         assert!(
-            FindingBundle::build(
-                LspInput::default(),
-                OutcomeClass::JsonRpcError,
-                FindingSet::new(),
-                prov,
-            )
-            .is_err()
+            prov.validate()
+                .unwrap_err()
+                .missing
+                .contains(&"agent_config")
         );
 
-        // Index mode additionally requires the backdrop + native SQLite fields.
-        let mut prov = index_provenance();
-        prov.backdrop_snapshot_hash = None;
-        prov.sqlite_artifact_hash = None;
-        let err = prov.validate().unwrap_err();
-        assert!(err.missing.contains(&"backdrop_snapshot_hash"));
-        assert!(err.missing.contains(&"sqlite_artifact_hash"));
-        // The same fields are NOT required in pc mode.
-        let mut pc = pc_provenance();
-        pc.backdrop_snapshot_hash = None;
-        assert!(pc.validate().is_ok());
+        // An unknown profile mode is rejected (it could otherwise bypass index-mode requirements).
+        let mut prov = pc_provenance();
+        prov.scala_profile_mode = "bogus".to_string();
+        assert!(
+            prov.validate()
+                .unwrap_err()
+                .missing
+                .contains(&"scala_profile_mode")
+        );
+
+        // Index mode additionally requires all backdrop + SemanticDB + BSP + native SQLite fields.
+        for clear in [
+            "backdrop_commit",
+            "backdrop_snapshot_hash",
+            "semanticdb_hash",
+            "bsp_hash",
+            "sqlite_artifact_hash",
+        ] {
+            let mut prov = index_provenance();
+            match clear {
+                "backdrop_commit" => prov.backdrop_commit = None,
+                "backdrop_snapshot_hash" => prov.backdrop_snapshot_hash = None,
+                "semanticdb_hash" => prov.semanticdb_hash = None,
+                "bsp_hash" => prov.bsp_hash = None,
+                "sqlite_artifact_hash" => prov.sqlite_artifact_hash = None,
+                _ => unreachable!(),
+            }
+            assert!(
+                prov.validate().unwrap_err().missing.contains(&clear),
+                "{clear} should be required in index mode"
+            );
+        }
+        // None of those index-only fields are required in pc mode.
+        assert!(pc_provenance().validate().is_ok());
     }
 
     #[test]
@@ -643,26 +886,192 @@ mod tests {
         let empty = FindingSet::new();
         let mut errs = FindingSet::new();
         errs.record(Finding::json_rpc_error("m", -1, "e"));
+        // A hang is a timeout.
         assert_eq!(
-            classify_replay(true, false, &empty, false),
+            classify_replay(ProcessEnd::TimedOut, "", &empty),
+            OutcomeClass::TimeoutOrDeadlock
+        );
+        // Memory exhaustion from stderr, whatever the exit.
+        assert_eq!(
+            classify_replay(ProcessEnd::NonZero, "java.lang.OutOfMemoryError", &empty),
+            OutcomeClass::OutOfMemoryOrStackOverflow
+        );
+        assert_eq!(
+            classify_replay(
+                ProcessEnd::Signalled,
+                "java.lang.StackOverflowError",
+                &empty
+            ),
+            OutcomeClass::OutOfMemoryOrStackOverflow
+        );
+        // Uncaught exceptions: foreground vs background by thread.
+        assert_eq!(
+            classify_replay(
+                ProcessEnd::NonZero,
+                "Exception in thread \"main\" x",
+                &empty
+            ),
+            OutcomeClass::ForegroundException
+        );
+        assert_eq!(
+            classify_replay(
+                ProcessEnd::NonZero,
+                "Exception in thread \"pool-1\" x",
+                &empty
+            ),
+            OutcomeClass::BackgroundException
+        );
+        // A fatal-log line.
+        assert_eq!(
+            classify_replay(ProcessEnd::NonZero, "FATAL boom", &empty),
+            OutcomeClass::LoggedFatal
+        );
+        // A non-zero exit or a signal with no clearer evidence is a hard JVM fatal.
+        assert_eq!(
+            classify_replay(ProcessEnd::NonZero, "", &empty),
             OutcomeClass::JvmFatal
         );
         assert_eq!(
-            classify_replay(false, true, &empty, false),
-            OutcomeClass::TimeoutOrDeadlock
+            classify_replay(ProcessEnd::Signalled, "", &empty),
+            OutcomeClass::JvmFatal
         );
+        // A clean exit: JSON-RPC errors are findings, otherwise a normal success.
         assert_eq!(
-            classify_replay(false, false, &empty, false),
-            OutcomeClass::TimeoutOrDeadlock
-        );
-        assert_eq!(
-            classify_replay(false, false, &errs, true),
+            classify_replay(ProcessEnd::Clean, "", &errs),
             OutcomeClass::JsonRpcError
         );
         assert_eq!(
-            classify_replay(false, false, &empty, true),
+            classify_replay(ProcessEnd::Clean, "", &empty),
             OutcomeClass::NormalSuccess
         );
+    }
+
+    // Run a cold replay against a small shell script (no real LS) to exercise the process-end +
+    // stderr classification end to end.
+    fn replay_script(script: &str, timeout: Duration) -> OutcomeClass {
+        let profile = ScalaExecutionProfile::presentation_compiler();
+        let temp = tempfile::tempdir().unwrap();
+        let config = ColdReplayConfig {
+            profile: &profile,
+            program: "sh".to_string(),
+            args: vec!["-c".to_string(), script.to_string()],
+            temp_root: temp.path().to_path_buf(),
+            backdrop_root: None,
+            timeout,
+        };
+        cold_replay(&LspInput::default(), &config)
+            .expect("cold replay launches the script")
+            .outcome_class
+    }
+
+    #[test]
+    fn cold_replay_classifies_process_failures_from_stderr_and_exit() {
+        let t = Duration::from_secs(5);
+        assert_eq!(
+            replay_script("cat >/dev/null; exit 0", t),
+            OutcomeClass::NormalSuccess
+        );
+        assert_eq!(
+            replay_script("cat >/dev/null; exit 3", t),
+            OutcomeClass::JvmFatal
+        );
+        assert_eq!(
+            replay_script(
+                "cat >/dev/null; echo 'java.lang.OutOfMemoryError: Java heap space' >&2; exit 1",
+                t
+            ),
+            OutcomeClass::OutOfMemoryOrStackOverflow
+        );
+        assert_eq!(
+            replay_script(
+                "cat >/dev/null; echo 'Exception in thread \"main\" java.lang.NullPointerException' >&2; exit 1",
+                t
+            ),
+            OutcomeClass::ForegroundException
+        );
+        assert_eq!(
+            replay_script(
+                "cat >/dev/null; echo 'Exception in thread \"pool-1-thread-2\" java.lang.IllegalStateException' >&2; exit 1",
+                t
+            ),
+            OutcomeClass::BackgroundException
+        );
+        assert_eq!(
+            replay_script(
+                "cat >/dev/null; echo 'FATAL: server aborting' >&2; exit 1",
+                t
+            ),
+            OutcomeClass::LoggedFatal
+        );
+        // A hang is killed at the deadline and classed as a timeout.
+        assert_eq!(
+            replay_script("cat >/dev/null; sleep 30", Duration::from_millis(400)),
+            OutcomeClass::TimeoutOrDeadlock
+        );
+    }
+
+    // Build a minimal fake frozen backdrop with the markers the index materializer verifies.
+    fn fake_backdrop(dir: &Path) {
+        std::fs::write(dir.join("backdrop-metadata.json"), b"{}").unwrap();
+        std::fs::create_dir_all(dir.join("bsp")).unwrap();
+        std::fs::write(dir.join("bsp").join("mill-bsp.json"), b"{}").unwrap();
+        let sdb = dir.join("semanticdb");
+        std::fs::create_dir_all(&sdb).unwrap();
+        std::fs::write(sdb.join("Main.scala.semanticdb"), b"\0").unwrap();
+    }
+
+    #[test]
+    fn index_cold_replay_overlays_backdrop_and_initializes_at_its_root() {
+        let backdrop = tempfile::tempdir().unwrap();
+        fake_backdrop(backdrop.path());
+        let capture = backdrop.path().join("captured-stream.bin");
+        let profile = ScalaExecutionProfile::index();
+        // The script captures the request stream the shipped entrypoint would receive, then exits.
+        let config = ColdReplayConfig {
+            profile: &profile,
+            program: "sh".to_string(),
+            args: vec![
+                "-c".to_string(),
+                format!("cat > {} ; exit 0", capture.display()),
+            ],
+            temp_root: tempfile::tempdir().unwrap().path().to_path_buf(),
+            backdrop_root: Some(backdrop.path().to_path_buf()),
+            timeout: Duration::from_secs(5),
+        };
+        let observation = cold_replay(&LspInput::default(), &config).unwrap();
+        assert_eq!(observation.outcome_class, OutcomeClass::NormalSuccess);
+
+        // The index materializer overlaid the backdrop (created its overlay dir under the root).
+        assert!(backdrop.path().join(".lsp-fuzz-overlay").is_dir());
+
+        // The captured initialize request roots at the backdrop root, not a scratch temp dir.
+        let stream = std::fs::read(&capture).unwrap();
+        let messages = parse_lsp_payloads(&stream);
+        let backdrop_uri = format!("file://{}", uri::workspace_uri(backdrop.path()).unwrap());
+        let init = messages
+            .iter()
+            .find_map(|m| match m {
+                JsonRPCMessage::Request { method, params, .. } if method == "initialize" => {
+                    Some(params.clone())
+                }
+                _ => None,
+            })
+            .expect("the stream contains an initialize request");
+        assert_eq!(init["rootUri"].as_str(), Some(backdrop_uri.as_str()));
+    }
+
+    #[test]
+    fn index_cold_replay_requires_a_backdrop_root() {
+        let profile = ScalaExecutionProfile::index();
+        let config = ColdReplayConfig {
+            profile: &profile,
+            program: "sh".to_string(),
+            args: vec!["-c".to_string(), "exit 0".to_string()],
+            temp_root: tempfile::tempdir().unwrap().path().to_path_buf(),
+            backdrop_root: None,
+            timeout: Duration::from_secs(5),
+        };
+        assert!(cold_replay(&LspInput::default(), &config).is_err());
     }
 
     /// Live cold replay through the shipped `ls.core.Main`: a benign input replays to a clean
@@ -681,21 +1090,23 @@ mod tests {
         }
         let java = std::env::var_os("LS_JAVA").map_or_else(|| PathBuf::from("java"), PathBuf::from);
 
+        let profile = ScalaExecutionProfile::presentation_compiler();
         let temp = tempfile::tempdir().unwrap();
-        let args = vec![
-            "--enable-native-access=ALL-UNNAMED".to_string(),
-            "-cp".to_string(),
-            ls_jar.display().to_string(),
-            "ls.core.Main".to_string(),
-        ];
-        let observation = cold_replay(
-            &LspInput::default(),
-            &java.display().to_string(),
-            &args,
-            temp.path(),
-            Duration::from_mins(1),
-        )
-        .expect("cold replay should launch the shipped entrypoint");
+        let config = ColdReplayConfig {
+            profile: &profile,
+            program: java.display().to_string(),
+            args: vec![
+                "--enable-native-access=ALL-UNNAMED".to_string(),
+                "-cp".to_string(),
+                ls_jar.display().to_string(),
+                "ls.core.Main".to_string(),
+            ],
+            temp_root: temp.path().to_path_buf(),
+            backdrop_root: None,
+            timeout: Duration::from_mins(1),
+        };
+        let observation = cold_replay(&LspInput::default(), &config)
+            .expect("cold replay launches the entrypoint");
         // A benign input drives initialize/shutdown/exit with no JSON-RPC errors and no crash.
         assert_eq!(observation.outcome_class, OutcomeClass::NormalSuccess);
         assert!(observation.findings.is_empty());
@@ -717,5 +1128,70 @@ mod tests {
         let bytes = std::fs::read(&path).unwrap();
         let decoded: FindingBundle = ciborium::from_reader(&bytes[..]).unwrap();
         assert_eq!(decoded, bundle);
+    }
+
+    #[test]
+    fn write_is_one_bundle_per_finding_and_never_overwrites() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // Two inputs share the (empty) workspace but differ in their message sequence; each must get
+        // its own file because the name hashes the WHOLE input, not just the workspace.
+        let input_a = LspInput::default();
+        let mut input_b = LspInput::default();
+        input_b.messages.push(crate::lsp::LspMessage::Shutdown(()));
+        let b_a = FindingBundle::build(
+            input_a,
+            OutcomeClass::JvmFatal,
+            FindingSet::new(),
+            pc_provenance(),
+        )
+        .unwrap();
+        let b_b = FindingBundle::build(
+            input_b,
+            OutcomeClass::JvmFatal,
+            FindingSet::new(),
+            pc_provenance(),
+        )
+        .unwrap();
+        let pa = b_a.write_to(dir.path()).unwrap();
+        let pb = b_b.write_to(dir.path()).unwrap();
+        assert_ne!(
+            pa, pb,
+            "different message sequences must not share a bundle file"
+        );
+
+        // Re-writing an identical bundle is idempotent (no new file).
+        assert_eq!(b_a.write_to(dir.path()).unwrap(), pa);
+
+        // Two DIFFERENT bundles that hash to the same base name (same input + class, different
+        // findings) get a collision-safe suffix rather than overwriting each other.
+        let same_input = LspInput::default();
+        let mut findings = FindingSet::new();
+        findings.record(Finding::json_rpc_error(
+            "textDocument/hover",
+            -32603,
+            "boom",
+        ));
+        let b_c = FindingBundle::build(
+            same_input,
+            OutcomeClass::NormalSuccess,
+            FindingSet::new(),
+            pc_provenance(),
+        )
+        .unwrap();
+        let b_d = FindingBundle::build(
+            LspInput::default(),
+            OutcomeClass::NormalSuccess,
+            findings,
+            pc_provenance(),
+        )
+        .unwrap();
+        let pc = b_c.write_to(dir.path()).unwrap();
+        let pd = b_d.write_to(dir.path()).unwrap();
+        assert_ne!(
+            pc, pd,
+            "a differing bundle must not overwrite an existing one"
+        );
+        assert!(pc.exists() && pd.exists());
     }
 }
