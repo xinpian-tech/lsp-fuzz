@@ -81,7 +81,7 @@ Mutations are grammar-guided:
 
 ### Language Grammars (`lsp-fuzz-grammars/`)
 
-`Language` enum lists all supported languages (C, C++, JavaScript, Ruby, Rust, TOML, LaTeX, BibTeX, Verilog, Solidity, MLIR, QML). The `language_data.rs` and `language.rs` files map each variant to its tree-sitter parser and LSP language ID. Some grammars use forked upstream repos (hosted under `github.com/henryhchchc`).
+`Language` enum lists all supported languages (C, C++, JavaScript, Ruby, Rust, TOML, LaTeX, BibTeX, Verilog, Solidity, MLIR, QML, Scala). The `language_data.rs` and `language.rs` files map each variant to its tree-sitter parser and LSP language ID. Some grammars use forked upstream repos (hosted under `github.com/henryhchchc`). Scala additionally targets a JVM language server via a bytecode coverage agent + a JVM-specific executor — see the `docs/jvm-*.md` docs and the `--jvm-worker`/`--scala-mode` fuzz flags and the `cold-replay` subcommand.
 
 ### CLI (`lsp-fuzz-cli/src/cli/`)
 

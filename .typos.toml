@@ -1,0 +1,7 @@
+# Vendored upstream code and generated grammar data are not our prose; exclude them from spell-checking
+# (they contain intentional test strings like "abd" and regex classes like `\p{Nd}` / `[rRfFpPnN*]`).
+[files]
+extend-exclude = [
+  "crates/lsp-fuzz/src/stolen/**",
+  "crates/lsp-fuzz-grammars/res/grammar/**",
+]

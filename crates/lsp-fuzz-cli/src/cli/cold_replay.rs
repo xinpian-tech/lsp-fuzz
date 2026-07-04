@@ -39,10 +39,24 @@ pub struct ColdReplayCommand {
     output: Option<PathBuf>,
 }
 
+/// Load a finding bundle from `path` and revalidate its provenance, rejecting a bundle whose required
+/// provenance fields are absent (e.g. a hand-edited or corrupt CBOR) before any replay — so the
+/// operator replay path upholds the fully-provenanced guarantee, not only the export path.
+fn load_validated_bundle(path: &std::path::Path) -> anyhow::Result<FindingBundle> {
+    let bundle = FindingBundle::read_from(path)
+        .with_context(|| format!("Loading finding bundle {}", path.display()))?;
+    bundle.provenance.validate().map_err(|missing| {
+        anyhow::anyhow!(
+            "finding bundle {} has incomplete provenance: {missing}",
+            path.display()
+        )
+    })?;
+    Ok(bundle)
+}
+
 impl ColdReplayCommand {
     pub fn run(self, _global_options: GlobalOptions) -> anyhow::Result<()> {
-        let mut bundle = FindingBundle::read_from(&self.bundle)
-            .with_context(|| format!("Loading finding bundle {}", self.bundle.display()))?;
+        let mut bundle = load_validated_bundle(&self.bundle)?;
 
         // Rebuild the execution profile the finding was produced under so the replay drives the same
         // materializer / initialize / method-allowlist surface.
@@ -114,11 +128,84 @@ impl ColdReplayCommand {
 #[cfg(test)]
 mod tests {
     use clap::Parser;
+    use lsp_fuzz::{
+        execution::outcome::OutcomeClass,
+        finding_bundle::{FindingBundle, Provenance, Replayability},
+        findings::FindingSet,
+        lsp_input::LspInput,
+    };
 
-    use super::ColdReplayCommand;
+    use super::{ColdReplayCommand, load_validated_bundle};
+
+    /// A bundle whose provenance is incomplete (as if hand-edited/corrupted) is rejected on load,
+    /// before any server is spawned — the operator replay path stays fully provenanced.
+    #[test]
+    fn cold_replay_rejects_incomplete_provenance_on_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tampered.cbor");
+        // Construct a bundle directly (bypassing FindingBundle::build's validation) with a missing
+        // required field, and serialize it.
+        let bundle = FindingBundle {
+            input: LspInput::default(),
+            outcome_class: OutcomeClass::JvmFatal,
+            findings: FindingSet::new(),
+            provenance: Provenance {
+                scala_profile_mode: "pc".to_string(),
+                run_timeout_ms: 30_000,
+                ls_commit: None, // required field missing
+                ls_classpath_hash: Some("cp".to_string()),
+                jdk_flags: vec!["none".to_string()],
+                agent_version: Some("agent-1".to_string()),
+                agent_config: Some("asm-9.8".to_string()),
+                backdrop_commit: None,
+                backdrop_snapshot_hash: None,
+                semanticdb_hash: None,
+                bsp_hash: None,
+                sqlite_artifact_hash: None,
+            },
+            replayability: Replayability::InProcessHarnessOnly,
+        };
+        std::fs::write(&path, bundle.to_cbor().unwrap()).unwrap();
+
+        let err = load_validated_bundle(&path).unwrap_err();
+        assert!(
+            err.to_string().contains("incomplete provenance"),
+            "expected a provenance rejection, got: {err}"
+        );
+    }
+
+    /// A complete bundle loads and revalidates cleanly.
+    #[test]
+    fn cold_replay_loads_complete_provenance() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("good.cbor");
+        let provenance = Provenance {
+            scala_profile_mode: "pc".to_string(),
+            run_timeout_ms: 30_000,
+            ls_commit: Some("abc".to_string()),
+            ls_classpath_hash: Some("cp".to_string()),
+            jdk_flags: vec!["none".to_string()],
+            agent_version: Some("agent-1".to_string()),
+            agent_config: Some("asm-9.8".to_string()),
+            backdrop_commit: None,
+            backdrop_snapshot_hash: None,
+            semanticdb_hash: None,
+            bsp_hash: None,
+            sqlite_artifact_hash: None,
+        };
+        let bundle = FindingBundle::build(
+            LspInput::default(),
+            OutcomeClass::JvmFatal,
+            FindingSet::new(),
+            provenance,
+        )
+        .unwrap();
+        std::fs::write(&path, bundle.to_cbor().unwrap()).unwrap();
+        assert!(load_validated_bundle(&path).is_ok());
+    }
 
     /// The cold-replay command parses with a bundle + jar and optional java/backdrop/output, so it is
-    /// invokable as a one-command cold replay (the live run is gated on a real server at runtime).
+    /// usable as a one-command cold replay (the live run is gated on a real server at runtime).
     #[test]
     fn cold_replay_parses_bundle_and_jar() {
         let parsed = ColdReplayCommand::try_parse_from([

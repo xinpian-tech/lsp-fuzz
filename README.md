@@ -156,6 +156,61 @@ To learn more about the options, run `lsp-fuzz-cli fuzz --help`.
 > [!IMPORTANT]
 > Do not move the exported test cases, because the LSP requests are encoded with _absolute paths_. Moving them will invalidate the requests (analogous to the concept of [pinning](https://doc.rust-lang.org/std/pin/index.html) in Rust – they are "pinned" to `<export-directory>`).
 
+## Fuzzing JVM Language Servers (Scala)
+
+Native AFL++ instrumentation does not apply to a JVM language server, so LSPFuzz also supports a
+JVM-specific path: a bytecode **coverage agent** instruments the server in-process and writes an
+AFL-shaped edge map, and a JVM-specific executor drives a persistent worker that hosts the server and
+copies that map out (no fork server, no ELF/AFL signatures). Scala is a supported language, and the
+target is the Scala 3 BSP/semantic language server. See `docs/jvm-target.md`,
+`docs/jvm-coverage-agent.md`, and `docs/jvm-coverage-lifecycle.md` for the design.
+
+Instead of `--lsp-executable`, pass the worker argv with `--jvm-worker` (each token is preserved
+verbatim; place it last so its arguments are not consumed as fuzzer flags), and choose the Scala
+profile mode with `--scala-mode`:
+
+```bash
+lsp-fuzz-cli fuzz \
+  --state <state-dir> \
+  --scala-mode pc \                 # `pc` (presentation compiler) or `index` (BSP-backed index paths)
+  --language-fragments Scala=<fragment-output> \
+  --time-budget 24 \
+  --jvm-worker java --enable-native-access=ALL-UNNAMED -javaagent:<agent.jar> -cp <ls.jar> cov.Worker
+```
+
+- `pc` mode exercises presentation-compiler paths (completion/hover/signatureHelp/definition).
+- `index` mode exercises BSP-backed index paths (references/rename/workspace-symbol) over a frozen,
+  pre-indexed backdrop and requires `LS_SQLITE_LIB` (the server's pinned native SQLite) and
+  `BACKDROP_OUT` (a verified frozen backdrop root; see `docs/zaozi-backdrop.md`).
+- The server must run on its **exact pinned JDK** — a foreign JDK build segfaults the server's FFM
+  SQLite binding.
+
+### Findings and one-command cold replay
+
+On the JVM path, findings (JSON-RPC error responses and the outcome-oracle classes) are exported as
+provenanced bundles under `<state-dir>/solutions/finding-bundles`. Each bundle records the serialized
+input plus the provenance needed to reproduce it (LS commit + classpath hash, JDK flags, agent
+version/config, frozen-backdrop commit + snapshot / SemanticDB / BSP hashes, native SQLite artifact
+hash, profile mode, and timeout budget); export is fail-closed, so a finding without complete
+provenance is not written. Provide the provenance via the environment for a real campaign: `LS_COMMIT`,
+`LS_CLASSPATH_HASH`, `COV_AGENT_VERSION`, `COV_AGENT_CONFIG`, `JDK_FLAGS`, and (index mode)
+`BACKDROP_COMMIT`, `BACKDROP_SNAPSHOT_HASH`, `SEMANTICDB_HASH`, `BSP_HASH`, `SQLITE_ARTIFACT_HASH`.
+
+Replay a finding from a cold JVM through the shipped `ls.core.Main` stdio entrypoint and confirm it
+reproduces the recorded outcome class:
+
+```bash
+lsp-fuzz-cli cold-replay \
+  --bundle <state-dir>/solutions/finding-bundles/<finding>.cbor \
+  --ls-jar <ls.jar> \               # or $LS_JAR
+  --java <pinned-jdk>/bin/java \    # or $LS_JAVA — MUST be the server's pinned JDK
+  --backdrop-root <backdrop> \      # or $BACKDROP_OUT (required for index-mode findings)
+  --output <confirmed>.cbor         # optional: write back the confirmed bundle
+```
+
+A finding that reproduces is marked **confirmed**; one that does not is labelled
+**in-process-harness-only** rather than presented as a confirmed server crash.
+
 ## License
 
 LSPFuzz is released under the MIT License. See the [LICENSE](./LICENSE) file for details.

@@ -10,7 +10,9 @@
 #     no target is IndexUnavailable;
 #   * workspace/symbol returns a hit under the workspace, references returns a non-empty array, and
 #     rename returns a non-empty WorkspaceEdit (JSON-RPC errors fail the gate);
-#   * coverage reaches >=1 scala.meta.* AND >=1 server index namespace (ls.index/postings/rename/sqlite).
+#   * coverage reaches >=1 ls.semanticdb.* (the LS's own SemanticDB reader) AND >=1 server index
+#     namespace (ls.index/postings/rename/sqlite). (This LS does not load scala.meta.* on the index
+#     path; scala.meta is only reported for information.)
 #
 # A single module keeps the BSP compile within the LS's 30s request timeout. references/rename are
 # driven against the on-disk indexed file (no unsaved buffer — the LS excludes unsaved-buffer symbols
