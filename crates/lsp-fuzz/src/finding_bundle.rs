@@ -18,10 +18,10 @@ use std::{
     borrow::Cow,
     io::{self, Cursor, Read, Write},
     path::{Path, PathBuf},
-    process::{ChildStderr, ChildStdout, Command, Stdio},
-    sync::mpsc::{RecvTimeoutError, Sender, channel},
+    process::{ChildStderr, ChildStdin, ChildStdout, Command, Stdio},
+    sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel},
     thread::JoinHandle,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use libafl::{
@@ -432,30 +432,81 @@ fn has_fatal_log(stderr: &str) -> bool {
 /// Upper bound on captured stderr, so a chatty shipped entrypoint cannot exhaust the driver's memory.
 const STDERR_CAPTURE_CAP: usize = 64 * 1024;
 
+/// Feed the entrypoint's stdin on a thread, staging the writes with barriers that mirror the warm
+/// in-process worker (`cov::LsIterationBody`: `initialized` once per epoch, then `requestAndWait` for
+/// each request, never `shutdown`/`exit` per input).
+///
+/// First it writes the handshake (`initialize` + `initialized`) and waits for bootstrap readiness
+/// (`ready_rx`, fed by the stderr reader); firing everything at once races the async bootstrap and
+/// yields a spurious `-32803 "workspace is not ready"` instead of the genuine outcome. Then it replays
+/// each step in order: a notification is written and left, while a request is written alone and its
+/// exact response id (from `resp_id_rx`, fed by the stdout reader) is awaited before the next frame —
+/// so a later/out-of-order response can never let teardown cut off an earlier request. Finally it
+/// writes `shutdown`/`exit`, only after every request step has replied or the deadline expired. Every
+/// wait is bounded by a single overall `deadline` so a broken/hung server can never hang us.
+fn spawn_request_writer(
+    mut stdin: ChildStdin,
+    frames: ColdReplayFrames,
+    deadline: Duration,
+    ready_rx: Receiver<()>,
+    resp_id_rx: Receiver<usize>,
+) -> JoinHandle<()> {
+    std::thread::spawn(move || {
+        let deadline_at = Instant::now() + deadline;
+        let remaining = || deadline_at.saturating_duration_since(Instant::now());
+        let _ = stdin.write_all(&frames.handshake);
+        let _ = stdin.flush();
+        let _ = ready_rx.recv_timeout(remaining());
+        // Track which response ids have arrived (a later one may precede the request currently
+        // awaited), so awaiting an id already seen returns immediately.
+        let mut seen = std::collections::HashSet::new();
+        for step in &frames.steps {
+            let _ = stdin.write_all(step.bytes());
+            let _ = stdin.flush();
+            if let ReplayStep::Request { id, .. } = step {
+                while !seen.contains(id) {
+                    let wait = remaining();
+                    if wait.is_zero() {
+                        break;
+                    }
+                    match resp_id_rx.recv_timeout(wait) {
+                        Ok(rid) => {
+                            seen.insert(rid);
+                        }
+                        Err(_) => break, // deadline or reader gone: stop awaiting, tear down
+                    }
+                }
+            }
+        }
+        let _ = stdin.write_all(&frames.teardown);
+        let _ = stdin.flush();
+        drop(stdin); // signal end-of-input
+    })
+}
+
 /// Read the entrypoint's stdout to EOF, sending the full byte buffer on `out_tx` at the end. While
-/// reading, once the response to `last_request_id` (if any) is seen, signal `resp_tx` so the writer
-/// may send the teardown — the last sequential request replying implies the earlier ones did too.
+/// reading, announce each newly-seen response id on `resp_id_tx` so the writer can await the exact
+/// request it just sent before writing the next frame (responses may arrive out of order).
 fn spawn_response_reader(
     mut stdout: ChildStdout,
-    last_request_id: Option<usize>,
-    resp_tx: Sender<()>,
+    resp_id_tx: Sender<usize>,
     out_tx: Sender<Vec<u8>>,
 ) -> JoinHandle<()> {
     std::thread::spawn(move || {
         let mut buf = Vec::new();
         let mut chunk = [0u8; 8192];
-        let mut signalled = false;
+        let mut announced = std::collections::HashSet::new();
         loop {
             match stdout.read(&mut chunk) {
                 Ok(0) | Err(_) => break,
                 Ok(n) => {
                     buf.extend_from_slice(&chunk[..n]);
-                    if !signalled
-                        && let Some(id) = last_request_id
-                        && response_seen(&buf, id)
-                    {
-                        signalled = true;
-                        let _ = resp_tx.send(());
+                    // Re-parse the accumulated buffer (tiny for a replay) and announce any response id
+                    // not seen before, so an out-of-order or duplicated reply is reported exactly once.
+                    for rid in response_ids(&buf) {
+                        if announced.insert(rid) {
+                            let _ = resp_id_tx.send(rid);
+                        }
                     }
                 }
             }
@@ -543,7 +594,7 @@ pub fn cold_replay(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()?;
-    let mut stdin = child
+    let stdin = child
         .stdin
         .take()
         .ok_or_else(|| io::Error::other("no stdin"))?;
@@ -556,38 +607,14 @@ pub fn cold_replay(
         .take()
         .ok_or_else(|| io::Error::other("no stderr"))?;
 
-    // Drive the writes with two barriers that mirror the in-process worker's steady state:
-    //   1. write `initialize` + `initialized`, WAIT for bootstrap readiness (LS_BOOTSTRAP_READY_MARKER
-    //      on stderr) — firing everything at once races the async bootstrap and gets a spurious
-    //      `-32803 "workspace is not ready"` instead of the genuine per-request outcome;
-    //   2. write the requests, WAIT for the last request's response, THEN write `shutdown`/`exit` —
-    //      tearing the server down before a slow request replies would drop its response (and finding).
-    // Both waits are bounded by the deadline so a broken/hung server can never hang the writer.
+    // Drive the writes with barriers (see `spawn_request_writer`) that mirror the in-process worker's
+    // steady state and per-request await; the stderr reader releases readiness, the stdout reader
+    // announces each response id, both bounded by the deadline so a hung server can never hang us.
     let (ready_tx, ready_rx) = channel::<()>();
-    let (resp_tx, resp_rx) = channel::<()>();
-    let deadline = config.timeout;
-    let ColdReplayFrames {
-        handshake,
-        requests,
-        teardown,
-        last_request_id,
-    } = frames;
-    let writer = std::thread::spawn(move || {
-        let _ = stdin.write_all(&handshake);
-        let _ = stdin.flush();
-        let _ = ready_rx.recv_timeout(deadline);
-        let _ = stdin.write_all(&requests);
-        let _ = stdin.flush();
-        // Wait for the last request's response before tearing down (only if a request was sent).
-        if last_request_id.is_some() {
-            let _ = resp_rx.recv_timeout(deadline);
-        }
-        let _ = stdin.write_all(&teardown);
-        let _ = stdin.flush();
-        drop(stdin); // signal end-of-input
-    });
+    let (resp_id_tx, resp_id_rx) = channel::<usize>();
+    let writer = spawn_request_writer(stdin, frames, config.timeout, ready_rx, resp_id_rx);
     let (tx, rx) = channel();
-    let reader = spawn_response_reader(stdout, last_request_id, resp_tx, tx);
+    let reader = spawn_response_reader(stdout, resp_id_tx, tx);
     let err_reader = spawn_stderr_reader(stderr, ready_tx);
 
     // The server exits on `exit`, closing stdout and completing the read; if it hangs, the deadline
@@ -637,10 +664,10 @@ fn is_replayed(method: &str, profile: &ScalaExecutionProfile) -> bool {
     !LIFECYCLE_METHODS.contains(&method) && profile.allowed_methods().contains(&method)
 }
 
-/// The full cold-replay stream (handshake + requests + teardown concatenated), used by tests that
-/// assert the ordered method surface and id numbering. The live path writes the three parts with a
-/// bootstrap-readiness barrier and a response barrier between them (see [`build_cold_replay_frames`]
-/// and [`cold_replay`]).
+/// The full cold-replay stream (handshake + every step + teardown concatenated), used by tests that
+/// assert the ordered method surface and id numbering. The live path writes these parts with a
+/// bootstrap-readiness barrier and a per-request response barrier between them (see
+/// [`build_cold_replay_frames`] and [`cold_replay`]).
 #[cfg(test)]
 fn build_cold_replay_stream(
     input: &LspInput,
@@ -649,7 +676,12 @@ fn build_cold_replay_stream(
     localization_dir: &Path,
 ) -> Vec<u8> {
     let frames = build_cold_replay_frames(input, profile, root_uri, localization_dir);
-    [frames.handshake, frames.requests, frames.teardown].concat()
+    let mut stream = frames.handshake;
+    for step in &frames.steps {
+        stream.extend_from_slice(step.bytes());
+    }
+    stream.extend(frames.teardown);
+    stream
 }
 
 /// The id of the profile-supplied `initialize` request cold replay sends (the worker's initialize is
@@ -664,28 +696,46 @@ const COLD_REPLAY_INITIALIZE_ID: usize = 0;
 /// (warm, long-since-bootstrapped) in-process worker.
 const LS_BOOTSTRAP_READY_MARKER: &str = "bootstrap finished: ready";
 
-/// The three parts of a cold-replay stream, written with a barrier between each (see [`cold_replay`]).
+/// One frame the driver replays after the handshake. A request must be awaited before the next frame
+/// is sent (mirroring the worker's `requestAndWait`); a notification is fire-and-forget.
+#[derive(Debug)]
+enum ReplayStep {
+    /// A notification (e.g. `textDocument/didOpen`) — write and move on, no response is expected.
+    Notification(Vec<u8>),
+    /// A request — write it, then wait for the response with this exact `id` before the next frame.
+    Request { id: usize, bytes: Vec<u8> },
+}
+
+impl ReplayStep {
+    fn bytes(&self) -> &[u8] {
+        match self {
+            Self::Notification(b) | Self::Request { bytes: b, .. } => b,
+        }
+    }
+}
+
+/// The parts of a cold-replay stream, written with barriers between them (see [`cold_replay`]).
 struct ColdReplayFrames {
     /// `initialize` (id 0) + `initialized`, sent first.
     handshake: Vec<u8>,
-    /// The filtered didOpens + stored requests, sent only after the server signals readiness.
-    requests: Vec<u8>,
-    /// `shutdown` + `exit`, sent only after every stored request has been answered — the in-process
-    /// worker awaits each request's response and never tears the server down mid-request, so tearing
-    /// down before a slow request replies would drop its response and lose the finding.
+    /// The filtered didOpens + stored requests in input order, replayed AFTER the server signals
+    /// readiness. Requests are sent one at a time and each is awaited before the next frame, exactly
+    /// like [`cov::LsIterationBody`]'s per-request `requestAndWait` loop.
+    steps: Vec<ReplayStep>,
+    /// `shutdown` + `exit`, sent only after every request step has been answered (or the deadline
+    /// expired) — the worker never tears the server down mid-request, so tearing down while a request
+    /// is still in flight would drop its response and lose the finding.
     teardown: Vec<u8>,
-    /// The id of the last stored request sent (if any); the driver waits for its response — implying
-    /// the earlier sequential ids have also replied — before sending `teardown`.
-    last_request_id: Option<usize>,
 }
 
 /// Split the cold-replay stream into [`ColdReplayFrames`] so the driver can stage the writes: send the
-/// handshake, WAIT for bootstrap readiness ([`LS_BOOTSTRAP_READY_MARKER`]), send the requests, WAIT for
-/// their responses, then send `shutdown`/`exit`. This reproduces the steady state and the
-/// request-by-request await the persistent in-process worker uses (it emits `initialized` once per
-/// epoch and never sends `shutdown`/`exit` per input). Concatenating the three parts reproduces the
-/// previous single stream byte-for-byte (same ordering, same id numbering: initialize is id 0, the
-/// first sent stored request is id 1), so response matching is unaffected; only write *timing* changes.
+/// handshake, WAIT for bootstrap readiness ([`LS_BOOTSTRAP_READY_MARKER`]), replay each step (awaiting
+/// every request's exact response before the next frame), then send `shutdown`/`exit`. This reproduces
+/// the steady state AND the request-by-request await the persistent in-process worker uses (it emits
+/// `initialized` once per epoch and never sends `shutdown`/`exit` per input). Concatenating the parts
+/// reproduces the previous single stream byte-for-byte (same ordering, same id numbering: initialize is
+/// id 0, the first sent stored request is id 1), so response matching is unaffected; only the write
+/// *timing* changes.
 fn build_cold_replay_frames(
     input: &LspInput,
     profile: &ScalaExecutionProfile,
@@ -704,24 +754,23 @@ fn build_cold_replay_frames(
     handshake.extend(
         JsonRPCMessage::notification("initialized".into(), serde_json::json!({})).to_lsp_payload(),
     );
-    // The requests: generated didOpens + stored messages (filtered by the profile allowlist like the
-    // worker). A request carries an id; a notification (e.g. didOpen) does not, so the last request id
-    // is the highest id actually assigned to a request here.
-    let mut requests = Vec::new();
-    let mut last_request_id = None;
+    // The steps: generated didOpens + stored messages (filtered by the profile allowlist like the
+    // worker), in input order. Each is a request (awaited by id) or a notification (fire-and-forget).
+    let mut steps = Vec::new();
     for msg in input.message_sequence() {
         if !is_replayed(msg.method(), profile) {
             continue;
         }
         let before = id;
         let message = msg.into_json_rpc(&mut id, Some(&localize_uri));
-        if matches!(message, JsonRPCMessage::Request { .. }) {
-            // `into_json_rpc` consumed `before` as this request's id and advanced `id`.
-            last_request_id = Some(before);
-        }
-        requests.extend(message.to_lsp_payload());
+        let bytes = message.to_lsp_payload();
+        // `into_json_rpc` consumed `before` as a request's id and advanced `id`; a notification did not.
+        steps.push(match message {
+            JsonRPCMessage::Request { .. } => ReplayStep::Request { id: before, bytes },
+            _ => ReplayStep::Notification(bytes),
+        });
     }
-    // The teardown: a graceful shutdown/exit, sent only after the requests have been answered.
+    // The teardown: a graceful shutdown/exit, sent only after every request step has been answered.
     let mut teardown =
         JsonRPCMessage::request(id, "shutdown".into(), serde_json::Value::Null).to_lsp_payload();
     teardown.extend(
@@ -729,20 +778,24 @@ fn build_cold_replay_frames(
     );
     ColdReplayFrames {
         handshake,
-        requests,
+        steps,
         teardown,
-        last_request_id,
     }
 }
 
-/// Whether `bytes` (a stdout prefix) contains a [`JsonRPCMessage::Response`] to request id `id`.
-fn response_seen(bytes: &[u8], id: usize) -> bool {
-    parse_lsp_payloads(bytes).iter().any(|m| {
-        matches!(
-            m,
-            JsonRPCMessage::Response { id: Some(MessageId::Number(rid)), .. } if *rid == id
-        )
-    })
+/// The numeric response ids present in `bytes` (a stdout prefix), in occurrence order — used by the
+/// reader to announce each newly-seen response so the writer can await a specific request's reply.
+fn response_ids(bytes: &[u8]) -> Vec<usize> {
+    parse_lsp_payloads(bytes)
+        .iter()
+        .filter_map(|m| match m {
+            JsonRPCMessage::Response {
+                id: Some(MessageId::Number(rid)),
+                ..
+            } => Some(*rid),
+            _ => None,
+        })
+        .collect()
 }
 
 /// The stored input messages that cold replay actually sends (dropping lifecycle + methods outside
@@ -1309,11 +1362,25 @@ mod tests {
         );
     }
 
+    // The single method + kind (`true` = request awaited by id) carried by a replay step.
+    fn step_method(step: &ReplayStep) -> (String, bool) {
+        let m = parse_lsp_payloads(step.bytes()).into_iter().next().unwrap();
+        match (m, step) {
+            (JsonRPCMessage::Request { method, .. }, ReplayStep::Request { .. }) => {
+                (method.to_string(), true)
+            }
+            (JsonRPCMessage::Notification { method, .. }, ReplayStep::Notification(_)) => {
+                (method.to_string(), false)
+            }
+            other => panic!("step bytes / variant mismatch: {other:?}"),
+        }
+    }
+
     #[test]
-    fn cold_replay_frames_split_handshake_requests_teardown() {
-        // The frames must isolate the handshake (initialize + initialized) from the requests and the
-        // teardown (shutdown + exit), and report the last stored request id so the driver can wait for
-        // its response before tearing the server down.
+    fn cold_replay_frames_split_handshake_steps_teardown() {
+        // The frames must isolate the handshake (initialize + initialized) from the ordered replay
+        // steps and the teardown (shutdown + exit), and mark the stored request as an awaited Request
+        // carrying its id so the driver can wait for that exact response before the next frame.
         let mut input = LspInput::default();
         input.messages.push(request("textDocument/references", {
             let mut p = position_params("lsp-fuzz://a.scala");
@@ -1338,29 +1405,34 @@ mod tests {
             methods(&frames.handshake),
             vec!["initialize", "initialized"]
         );
-        assert_eq!(methods(&frames.requests), vec!["textDocument/references"]);
         assert_eq!(methods(&frames.teardown), vec!["shutdown", "exit"]);
-        // The first (and only) stored request gets id 1 (initialize consumed id 0).
-        assert_eq!(frames.last_request_id, Some(1));
+        // One replay step: the references request, awaited, with id 1 (initialize consumed id 0).
+        assert_eq!(frames.steps.len(), 1);
+        assert_eq!(
+            step_method(&frames.steps[0]),
+            ("textDocument/references".to_string(), true)
+        );
+        assert!(matches!(frames.steps[0], ReplayStep::Request { id: 1, .. }));
     }
 
     #[test]
-    fn response_seen_matches_only_the_target_id() {
-        let mut bytes = JsonRPCMessage::response(Some(0usize), Some(serde_json::json!({})), None)
-            .to_lsp_payload();
+    fn response_ids_extracts_only_numeric_response_ids_in_order() {
+        let mut bytes = JsonRPCMessage::response(Some(2usize), None, None).to_lsp_payload();
         bytes.extend(
             JsonRPCMessage::response(Some(1usize), Some(serde_json::json!({})), None)
                 .to_lsp_payload(),
         );
-        assert!(response_seen(&bytes, 0));
-        assert!(response_seen(&bytes, 1));
-        assert!(!response_seen(&bytes, 2));
+        // A request (has an id but is not a Response) must not be reported as a response id.
+        bytes.extend(
+            JsonRPCMessage::request(9usize, "x".into(), serde_json::Value::Null).to_lsp_payload(),
+        );
+        assert_eq!(response_ids(&bytes), vec![2, 1]);
     }
 
     #[test]
-    fn cold_replay_frames_report_no_request_when_all_dropped() {
+    fn cold_replay_frames_have_no_request_step_when_all_dropped() {
         // An index-mode input carrying only a pc-only request (completion) has it dropped, so there is
-        // no stored request to await — the driver must tear down immediately (last_request_id = None).
+        // no request step to await — the driver tears down right after readiness.
         let mut input = LspInput::default();
         input.messages.push(request(
             "textDocument/completion",
@@ -1369,7 +1441,66 @@ mod tests {
         let profile = ScalaExecutionProfile::index();
         let dir = tempfile::tempdir().unwrap();
         let frames = build_cold_replay_frames(&input, &profile, "file:///root", dir.path());
-        assert_eq!(frames.last_request_id, None);
+        assert!(
+            !frames
+                .steps
+                .iter()
+                .any(|s| matches!(s, ReplayStep::Request { .. }))
+        );
+    }
+
+    /// Regression for the Round-51 batched-replay gap: with TWO stored requests, a fake server replies
+    /// to the LATER request (id 2) immediately and the EARLIER one (id 1) only after a delay. The
+    /// sequential driver must still capture BOTH findings — it awaits id 1's response before tearing
+    /// the server down, so the earlier request's response is never cut off. The old design (send both,
+    /// wait for the highest id, then teardown) would drop the id-1 finding.
+    #[test]
+    fn cold_replay_waits_for_each_request_even_when_a_later_one_replies_first() {
+        let mut input = LspInput::default();
+        // Two pc-allowed requests → ids 1 (hover) and 2 (definition) in input order.
+        input.messages.push(request(
+            "textDocument/hover",
+            position_params("lsp-fuzz://a.scala"),
+        ));
+        input.messages.push(request(
+            "textDocument/definition",
+            position_params("lsp-fuzz://a.scala"),
+        ));
+        let profile = ScalaExecutionProfile::presentation_compiler();
+        // Fake stdio server: signal readiness, drain stdin so the writer never blocks, answer
+        // initialize (id 0), then reply to id 2 FIRST and id 1 only after a delay, both JSON-RPC errors.
+        let script = concat!(
+            "printf 'bootstrap finished: ready\\n' >&2; ",
+            "cat >/dev/null & ",
+            "emit() { n=$(printf %s \"$1\" | wc -c); printf 'Content-Length: %s\\r\\n\\r\\n%s' \"$n\" \"$1\"; }; ",
+            "emit '{\"jsonrpc\":\"2.0\",\"id\":0,\"result\":{}}'; ",
+            "emit '{\"jsonrpc\":\"2.0\",\"id\":2,\"error\":{\"code\":-32000,\"message\":\"later replied first\"}}'; ",
+            "sleep 0.5; ",
+            "emit '{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":-32000,\"message\":\"earlier replied second\"}}'; ",
+            "wait",
+        );
+        let temp = tempfile::tempdir().unwrap();
+        let config = ColdReplayConfig {
+            profile: &profile,
+            program: "sh".to_string(),
+            args: vec!["-c".to_string(), script.to_string()],
+            temp_root: temp.path().to_path_buf(),
+            backdrop_root: None,
+            timeout: Duration::from_secs(10),
+        };
+        let observation = cold_replay(&input, &config).unwrap();
+        let methods: std::collections::HashSet<_> =
+            observation.findings.iter().map(|f| f.signature()).collect();
+        assert!(
+            methods.iter().any(|s| s.contains("textDocument/hover")),
+            "the EARLIER request's finding (id 1, replied last) must not be cut off: {methods:?}"
+        );
+        assert!(
+            methods
+                .iter()
+                .any(|s| s.contains("textDocument/definition")),
+            "the later request's finding (id 2) must be present too: {methods:?}"
+        );
     }
 
     #[test]
