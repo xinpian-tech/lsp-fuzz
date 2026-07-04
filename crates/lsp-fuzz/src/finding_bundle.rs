@@ -1292,6 +1292,8 @@ mod tests {
                 "-cp".to_string(),
                 ls_jar.display().to_string(),
                 "ls.core.Main".to_string(),
+                // Match the fuzzer's in-process PC surface (the current LS forks the PC by default).
+                "--in-process-pc".to_string(),
             ],
             temp_root: temp.path().to_path_buf(),
             backdrop_root: None,

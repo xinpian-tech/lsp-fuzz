@@ -80,11 +80,15 @@ impl ColdReplayCommand {
             profile: &profile,
             program: self.java.display().to_string(),
             // `--enable-native-access` is required for the server's FFM SQLite binding.
+            // `--in-process-pc` runs the presentation compiler in this JVM: the current LS forks the
+            // PC into a child JVM by default, but the fuzzer's in-process worker embeds `ls.core.ScalaLs`
+            // (so its PC is in-process), so cold replay must match that surface for a comparable outcome.
             args: vec![
                 "--enable-native-access=ALL-UNNAMED".to_string(),
                 "-cp".to_string(),
                 self.ls_jar.display().to_string(),
                 "ls.core.Main".to_string(),
+                "--in-process-pc".to_string(),
             ],
             temp_root: temp_dir,
             backdrop_root: self.backdrop_root.clone(),

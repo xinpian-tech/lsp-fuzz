@@ -2,8 +2,9 @@
 
 The Scala fuzz target is `scala3-bsp-smantic-ls` (`ls.core.Main`), a JVM stdio language
 server (Java 25 + Scala 3.8.4, built with Mill). It has **no** GraalVM native-image path, so
-grey-box coverage must come from a JVM bytecode agent (see `docs/scala-lsp-fuzzing-plan.md`,
-route "Option B"). This document records how the target is provisioned reproducibly via Nix.
+grey-box coverage must come from a JVM bytecode agent surfaced through a JVM-specific executor (see
+`docs/scala-lsp-fuzzing-plan.md`). This document records how the target is provisioned reproducibly
+via Nix.
 
 ## Toolchain (from this repo)
 
@@ -34,8 +35,14 @@ confirms the "no JVM toolchain" blocker is lifted — the JVM route is buildable
 
 ## Launch flags relevant to fuzzing
 
-- `--in-process-pc` (default): the presentation compiler runs in this JVM, so a bytecode agent
-  can instrument it. Use this for fuzzing (avoid `--forked-pc`).
+- `--in-process-pc`: the presentation compiler runs in this JVM, so a bytecode agent on the main JVM
+  can instrument it (reaching `dotty.tools.pc.*`). The current LS defaults to `--forked-pc` (the PC
+  runs in an isolated child JVM the main-JVM agent cannot see), so pass `--in-process-pc` for the
+  agent-instrumented coverage gate and for cold replay through the shipped `ls.core.Main`, matching the
+  in-process fuzzing worker (which embeds `ls.core.ScalaLs` and is always in-process-PC).
+- The current LS also requires every source to be compiled with `-Xsemanticdb`, or it rejects requests
+  with `-32803 "… has no SemanticDB output"`; the BSP workspace's Mill module must set that scalac
+  option (see `setup-bsp-workspace.sh`).
 - The server speaks stdio JSON-RPC via lsp4j `LSPLauncher` (reads `System.in`, writes stdout).
 
 ## Next (later rounds)
