@@ -175,11 +175,15 @@ lsp-fuzz-cli fuzz \
   --scala-mode pc \
   --language-fragments Scala=<fragment-output> \
   --time-budget 24 \
-  --jvm-worker java --enable-native-access=ALL-UNNAMED -javaagent:<agent.jar> -cp <ls.jar> cov.Worker
+  --jvm-worker java -XX:-UseCompactObjectHeaders -Xshare:off -XX:+UseSerialGC \
+    --enable-native-access=ALL-UNNAMED -javaagent:<agent.jar> -cp <ls.jar> cov.Worker
 ```
 
 - `--scala-mode` selects `pc` (presentation compiler) or `index` (BSP-backed index paths).
 - `--jvm-worker` must come last, as the parser consumes everything after it as the worker argv.
+- The determinism flags (`-XX:-UseCompactObjectHeaders -Xshare:off -XX:+UseSerialGC`) are
+  **required** in the worker argv — the launch is rejected without them so the server always fuzzes
+  under the stable-coverage configuration (see `docs/jvm-coverage-agent.md`).
 - `pc` mode exercises presentation-compiler paths (completion/hover/signatureHelp/definition).
 - `index` mode exercises BSP-backed index paths (references/rename/workspace-symbol) over a frozen,
   pre-indexed backdrop and requires `LS_SQLITE_LIB` (the server's pinned native SQLite) and

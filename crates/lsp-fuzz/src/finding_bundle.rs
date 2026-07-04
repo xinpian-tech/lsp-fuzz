@@ -1492,7 +1492,7 @@ mod tests {
             .collect()
     }
 
-    /// Deterministic regression for the Round-51 batched-replay gap, observing the WRITE STREAM (stdin)
+    /// Deterministic regression against a batched cold-replay writer, observing the WRITE STREAM (stdin)
     /// directly: [`drive_replay_writes`] runs on a background thread against a recording writer while
     /// the test hand-drives the readiness/response channels, and asserts the exact frames written at
     /// each step. It proves the driver sends one request at a time and awaits that request's response

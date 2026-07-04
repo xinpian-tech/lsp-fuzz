@@ -32,6 +32,40 @@ fn assert_sources_present(sources: &[String]) {
     );
 }
 
+/// A JVM-mode `fuzz` launch whose `--jvm-worker` argv omits the determinism flags is rejected
+/// before any worker is spawned (so this needs no JDK): the Scala fuzzing config must run the server
+/// deterministically. Complements the happy-path smoke below, which DOES pass the flags.
+#[test]
+fn jvm_mode_rejects_worker_argv_without_determinism_flags() {
+    let state = tempfile::tempdir().expect("tempdir");
+    let output = Command::new(env!("CARGO_BIN_EXE_lsp-fuzz-cli"))
+        .args([
+            "fuzz",
+            "--state",
+            state.path().to_str().unwrap(),
+            "--time-budget",
+            "0",
+            "--scala-mode",
+            "pc",
+            "--jvm-worker",
+            "java",
+            "-cp",
+            "/nonexistent/ls.jar",
+            "cov.Worker",
+        ])
+        .output()
+        .expect("run CLI");
+    assert!(
+        !output.status.success(),
+        "a worker argv missing the determinism flags must be rejected"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("determinism") && stderr.contains("UseCompactObjectHeaders"),
+        "the error must name the missing determinism flags; got:\n{stderr}"
+    );
+}
+
 #[test]
 #[allow(clippy::too_many_lines, reason = "linear end-to-end smoke setup")]
 fn jvm_mode_fuzz_smoke_reaches_loop_without_deadlock() {
@@ -114,8 +148,12 @@ fn jvm_mode_fuzz_smoke_reaches_loop_without_deadlock() {
             "0",
             "--generate-seeds",
             "2",
+            // The determinism flags are required by run_jvm_mode's launch validation.
             "--jvm-worker",
             "java",
+            "-XX:-UseCompactObjectHeaders",
+            "-Xshare:off",
+            "-XX:+UseSerialGC",
             "-cp",
             out.to_str().unwrap(),
             "cov.Worker",

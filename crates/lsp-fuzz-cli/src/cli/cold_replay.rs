@@ -60,6 +60,28 @@ fn load_validated_bundle(path: &std::path::Path) -> anyhow::Result<FindingBundle
     Ok(bundle)
 }
 
+/// Build the `java` arguments for a cold replay: the SAME determinism flags as the fuzzing
+/// config (disable compact object headers, AOT/CDS, and non-serial GC — see
+/// `docs/jvm-coverage-agent.md`), then the runtime flags the server needs. `--enable-native-access` is
+/// required for the server's FFM `SQLite` binding; `--in-process-pc` runs the presentation compiler in
+/// this JVM (the shipped `Main` forks the PC by default, but the fuzzer's in-process worker embeds
+/// `ls.core.ScalaLs`, so cold replay must match that surface for a comparable outcome).
+fn scala_launch_args(profile: &ScalaExecutionProfile, ls_jar: &std::path::Path) -> Vec<String> {
+    let mut args: Vec<String> = profile
+        .determinism_flags()
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+    args.extend([
+        "--enable-native-access=ALL-UNNAMED".to_string(),
+        "-cp".to_string(),
+        ls_jar.display().to_string(),
+        "ls.core.Main".to_string(),
+        "--in-process-pc".to_string(),
+    ]);
+    args
+}
+
 impl ColdReplayCommand {
     pub fn run(self, _global_options: GlobalOptions) -> anyhow::Result<()> {
         let mut bundle = load_validated_bundle(&self.bundle)?;
@@ -85,17 +107,7 @@ impl ColdReplayCommand {
         let config = ColdReplayConfig {
             profile: &profile,
             program: self.java.display().to_string(),
-            // `--enable-native-access` is required for the server's FFM SQLite binding.
-            // `--in-process-pc` runs the presentation compiler in this JVM: the current LS forks the
-            // PC into a child JVM by default, but the fuzzer's in-process worker embeds `ls.core.ScalaLs`
-            // (so its PC is in-process), so cold replay must match that surface for a comparable outcome.
-            args: vec![
-                "--enable-native-access=ALL-UNNAMED".to_string(),
-                "-cp".to_string(),
-                self.ls_jar.display().to_string(),
-                "ls.core.Main".to_string(),
-                "--in-process-pc".to_string(),
-            ],
+            args: scala_launch_args(&profile, &self.ls_jar),
             temp_root: temp_dir,
             backdrop_root: self.backdrop_root.clone(),
             timeout: Duration::from_millis(
@@ -149,7 +161,33 @@ mod tests {
         lsp_input::LspInput,
     };
 
-    use super::{ColdReplayCommand, load_validated_bundle};
+    use lsp_fuzz::execution::scala_profile::ScalaExecutionProfile;
+
+    use super::{ColdReplayCommand, load_validated_bundle, scala_launch_args};
+
+    /// Cold replay must launch under the determinism flags (before `-cp`/main class) for both
+    /// Scala modes, so the replay reproduces the fuzzing config's coverage/behavior surface.
+    #[test]
+    fn scala_launch_args_carry_the_determinism_flags() {
+        for profile in [
+            ScalaExecutionProfile::index(),
+            ScalaExecutionProfile::presentation_compiler(),
+        ] {
+            let args = scala_launch_args(&profile, std::path::Path::new("/path/to/ls.jar"));
+            assert!(
+                profile.missing_determinism_flags(&args).is_empty(),
+                "cold-replay launch must carry every determinism flag: {args:?}"
+            );
+            // The determinism flags precede `-cp` (they are JVM flags, not program args).
+            let cp = args.iter().position(|a| a == "-cp").unwrap();
+            for flag in profile.determinism_flags() {
+                assert!(
+                    args[..cp].iter().any(|a| a == flag),
+                    "flag {flag} must precede -cp"
+                );
+            }
+        }
+    }
 
     /// A bundle whose provenance is incomplete (as if hand-edited/corrupted) is rejected on load,
     /// before any server is spawned — the operator replay path stays fully provenanced.

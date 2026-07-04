@@ -89,7 +89,9 @@ cp -r out/cov agentjar/
 mkdir -p agentjar/META-INF
 printf 'Premain-Class: cov.CoverageAgent\nCan-Retransform-Classes: true\n' > agentjar/META-INF/MANIFEST.MF
 ( cd agentjar && jar cfm ../agent.jar META-INF/MANIFEST.MF cov org )
-flags=(-XX:+UseCompactObjectHeaders --enable-native-access=ALL-UNNAMED)
+# fuzzing-determinism flags (stable coverage across identical inputs): disable compact object
+# headers, disable the AOT/CDS archive, single-threaded GC. See docs/jvm-coverage-agent.md.
+flags=(-XX:-UseCompactObjectHeaders -Xshare:off -XX:+UseSerialGC --enable-native-access=ALL-UNNAMED)
 [ "$COV_AGENT" = 1 ] && flags=(-javaagent:"$here/agent.jar" "${flags[@]}")
 
 # 4. Install BSP in the throwaway (single module -> BSP compile fits the LS's 30s request timeout).

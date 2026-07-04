@@ -338,6 +338,19 @@ impl FuzzCommand {
             .map_err(|e| anyhow::anyhow!(e))
             .context("The requested Scala mode is missing required environment")?;
 
+        // The Scala fuzzing configuration must launch the language server under the determinism
+        // flags so coverage is stable across identical inputs (see docs/jvm-coverage-agent.md). The
+        // worker argv is operator-supplied, so enforce the flags here rather than silently fuzzing
+        // under a non-deterministic JVM.
+        let missing = profile.missing_determinism_flags(&self.jvm_worker);
+        if !missing.is_empty() {
+            anyhow::bail!(
+                "the --jvm-worker launch is missing required determinism flags {missing:?}; \
+                 add them to the worker command (e.g. `java {} -javaagent:… -cp … cov.Worker`)",
+                profile.determinism_flags().join(" ")
+            );
+        }
+
         let grammar_ctx =
             load_grammar_lookup(&self.language_fragments).context("Creating grammar context")?;
 

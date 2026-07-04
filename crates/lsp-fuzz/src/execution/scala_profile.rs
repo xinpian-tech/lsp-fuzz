@@ -183,6 +183,32 @@ impl ScalaExecutionProfile {
         }
     }
 
+    /// The JVM determinism flags the Scala fuzzing configuration must launch the language
+    /// server under, so coverage is stable across identical inputs: disable compact object headers,
+    /// disable the AOT/CDS archive (`-Xshare:off`, and never pass `-XX:AOTCache*`), and use a
+    /// single-threaded GC to cut GC-thread coverage noise (documented in `docs/jvm-coverage-agent.md`).
+    /// The same set for both modes — it is the fuzzing config, not a per-mode policy.
+    #[must_use]
+    pub fn determinism_flags(&self) -> &'static [&'static str] {
+        &[
+            "-XX:-UseCompactObjectHeaders",
+            "-Xshare:off",
+            "-XX:+UseSerialGC",
+        ]
+    }
+
+    /// The determinism flags absent from a candidate JVM launch `argv`, in declared order. A
+    /// launch surface for the Scala fuzzing config must carry all of them; a non-empty result means the
+    /// launch is not running under the pinned determinism configuration and coverage may be unstable.
+    #[must_use]
+    pub fn missing_determinism_flags(&self, argv: &[String]) -> Vec<&'static str> {
+        self.determinism_flags()
+            .iter()
+            .copied()
+            .filter(|flag| !argv.iter().any(|a| a == flag))
+            .collect()
+    }
+
     /// Verify the required environment for this mode is present, and — for index mode — that
     /// `BACKDROP_OUT` points at a verified backdrop.
     ///
@@ -411,5 +437,55 @@ mod tests {
         assert_eq!(profile.file_extensions(), &["scala", "sc"]);
         assert_eq!(profile.language(), Language::Scala);
         assert_eq!(profile.mode(), ScalaProfileMode::PresentationCompiler);
+    }
+
+    #[test]
+    fn determinism_flags_are_the_expected_set_for_both_modes() {
+        let expected = [
+            "-XX:-UseCompactObjectHeaders",
+            "-Xshare:off",
+            "-XX:+UseSerialGC",
+        ];
+        assert_eq!(
+            ScalaExecutionProfile::index().determinism_flags(),
+            &expected
+        );
+        assert_eq!(
+            ScalaExecutionProfile::presentation_compiler().determinism_flags(),
+            &expected
+        );
+    }
+
+    #[test]
+    fn missing_determinism_flags_detects_absent_and_wrong_sign_flags() {
+        let profile = ScalaExecutionProfile::index();
+        let complete: Vec<String> = [
+            "java",
+            "-XX:-UseCompactObjectHeaders",
+            "-Xshare:off",
+            "-XX:+UseSerialGC",
+            "-cp",
+            "ls.jar",
+            "ls.core.Main",
+        ]
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+        assert!(profile.missing_determinism_flags(&complete).is_empty());
+
+        // The WRONG-sign compact-headers flag (`+` instead of `-`) does not satisfy the requirement,
+        // and `-Xshare:off` / `+UseSerialGC` are absent → all three reported missing.
+        let wrong: Vec<String> = ["java", "-XX:+UseCompactObjectHeaders", "-cp", "ls.jar"]
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        assert_eq!(
+            profile.missing_determinism_flags(&wrong),
+            vec![
+                "-XX:-UseCompactObjectHeaders",
+                "-Xshare:off",
+                "-XX:+UseSerialGC",
+            ]
+        );
     }
 }
