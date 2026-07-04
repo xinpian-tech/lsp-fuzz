@@ -941,6 +941,7 @@ mod tests {
             format!("{agent}/cov/Lifecycle.java"),
             format!("{agent}/cov/IterationBody.java"),
             format!("{agent}/cov/FixtureBody.java"),
+            format!("{agent}/cov/LsIterationBody.java"),
             format!("{agent}/cov/Worker.java"),
             format!("{agent}/fixture/Target.java"),
             format!("{agent}/fixture/LateWriteFixture.java"),
@@ -1004,6 +1005,7 @@ mod tests {
             format!("{agent}/cov/Lifecycle.java"),
             format!("{agent}/cov/IterationBody.java"),
             format!("{agent}/cov/FixtureBody.java"),
+            format!("{agent}/cov/LsIterationBody.java"),
             format!("{agent}/cov/Worker.java"),
             format!("{agent}/fixture/Target.java"),
             format!("{agent}/fixture/LateWriteFixture.java"),
@@ -1129,7 +1131,9 @@ mod tests {
     /// request futures tracked, quiescence honoured, no deadlock — against the actual language
     /// server. Gated on the LS jar (`LS_JAR`) run under its pinned JDK; skips loudly otherwise.
     #[test]
+    #[allow(clippy::too_many_lines, reason = "linear end-to-end real-LS setup")]
     fn real_in_process_ls_worker_lifecycle() {
+        use libafl::inputs::ToTargetBytes;
         let Some(ls_jar) = std::env::var_os("LS_JAR") else {
             eprintln!("skipping real_in_process_ls_worker_lifecycle: LS_JAR unset");
             return;
@@ -1213,26 +1217,128 @@ mod tests {
         let mut buf: Box<[u8; MAP_SIZE]> =
             vec![0u8; MAP_SIZE].into_boxed_slice().try_into().unwrap();
 
-        // Two distinct Scala inputs: each drives a real initialize(once)/didOpen/hover cycle whose
-        // futures are tracked, so the run is an attributable clean snapshot with no stall.
-        let first = worker.run_capturing(b"object A:\n  def x: Int = 1\n", &mut buf);
+        // Build the worker payloads from REAL fuzzer inputs, exactly as JVM-mode fuzzing does: the
+        // converter materializes each input's workspace, localizes its URIs, and frames its stored
+        // LSP message sequence into the envelope the worker replays against the real server.
+        let mut converter = crate::lsp_input::JvmLspInputConverter::new(out.path().to_path_buf());
+
+        // Input 1: a two-file workspace and two stored request kinds (hover + completion), so the
+        // real server opens both documents and executes both requests.
+        let input1 = two_file_input_with_messages();
+        let envelope1 = converter.to_target_bytes(&input1).to_vec();
+        let first = worker.run_capturing(&envelope1, &mut buf);
         assert!(
             first.coverage_attributable && !first.restart_required,
-            "the first in-process LS input must be an attributable snapshot: {first:?}"
-        );
-        let second = worker.run_capturing(b"object B:\n  val y: String = \"z\"\n", &mut buf);
-        assert!(
-            second.coverage_attributable && !second.restart_required,
-            "the second in-process LS input must be an attributable snapshot: {second:?}"
+            "the first real-input run must be an attributable snapshot (requests tracked + drained): {first:?}"
         );
 
         if agent_attached {
-            // Coverage must have reached real language-server classes, not just transport.
+            // The stored requests must have driven real language-server classes, not just transport.
             let classes = std::fs::read_to_string(&classes_file).unwrap_or_default();
             assert!(
                 classes.lines().any(|c| c.starts_with("ls.")),
                 "coverage should reach real ls.* classes; covered classes:\n{classes}"
             );
+        }
+
+        // Input 2: a different single-file workspace with a different message. It must be
+        // attributable and uncontaminated by input 1's documents/background work.
+        let input2 = single_file_input_with_message();
+        let envelope2 = converter.to_target_bytes(&input2).to_vec();
+        let second = worker.run_capturing(&envelope2, &mut buf);
+        assert!(
+            second.coverage_attributable && !second.restart_required,
+            "the second real-input run must be attributable and uncontaminated: {second:?}"
+        );
+    }
+
+    #[cfg(test)]
+    fn scala_document(source: &str) -> crate::text_document::TextDocument {
+        let mut doc = crate::text_document::TextDocument::new(
+            lsp_fuzz_grammars::Language::Scala,
+            source.into(),
+        );
+        doc.update_metadata();
+        doc
+    }
+
+    #[cfg(test)]
+    fn hover_message(uri: lsp_types::Uri) -> crate::lsp::LspMessage {
+        crate::lsp::LspMessage::from_params::<lsp_types::request::HoverRequest>(
+            lsp_types::HoverParams {
+                text_document_position_params: lsp_types::TextDocumentPositionParams {
+                    text_document: lsp_types::TextDocumentIdentifier { uri },
+                    position: lsp_types::Position::new(0, 7),
+                },
+                work_done_progress_params: lsp_types::WorkDoneProgressParams::default(),
+            },
+        )
+    }
+
+    #[cfg(test)]
+    fn completion_message(uri: lsp_types::Uri) -> crate::lsp::LspMessage {
+        crate::lsp::LspMessage::from_params::<lsp_types::request::Completion>(
+            lsp_types::CompletionParams {
+                text_document_position: lsp_types::TextDocumentPositionParams {
+                    text_document: lsp_types::TextDocumentIdentifier { uri },
+                    position: lsp_types::Position::new(1, 4),
+                },
+                work_done_progress_params: lsp_types::WorkDoneProgressParams::default(),
+                partial_result_params: lsp_types::PartialResultParams::default(),
+                context: None,
+            },
+        )
+    }
+
+    #[cfg(test)]
+    fn source_entry(
+        source: &str,
+    ) -> crate::file_system::FileSystemEntry<crate::lsp_input::WorkspaceEntry> {
+        crate::file_system::FileSystemEntry::File(crate::lsp_input::WorkspaceEntry::SourceFile(
+            scala_document(source),
+        ))
+    }
+
+    #[cfg(test)]
+    fn virtual_uri(name: &str) -> lsp_types::Uri {
+        crate::lsp_input::uri::virtual_uri_for_path(std::path::Path::new(name))
+            .expect("virtual URI for a workspace file")
+    }
+
+    #[cfg(test)]
+    fn two_file_input_with_messages() -> crate::lsp_input::LspInput {
+        use crate::utf8::Utf8Input;
+        let workspace = crate::file_system::FileSystemDirectory::from([
+            (
+                Utf8Input::new("A.scala".to_owned()),
+                source_entry("object A:\n  def value: Int = 1\n"),
+            ),
+            (
+                Utf8Input::new("B.scala".to_owned()),
+                source_entry("object B:\n  val y = A.value\n"),
+            ),
+        ]);
+        let mut messages = crate::lsp_input::messages::LspMessageSequence::default();
+        messages.push(hover_message(virtual_uri("A.scala")));
+        messages.push(completion_message(virtual_uri("B.scala")));
+        crate::lsp_input::LspInput {
+            messages,
+            workspace,
+        }
+    }
+
+    #[cfg(test)]
+    fn single_file_input_with_message() -> crate::lsp_input::LspInput {
+        use crate::utf8::Utf8Input;
+        let workspace = crate::file_system::FileSystemDirectory::from([(
+            Utf8Input::new("C.scala".to_owned()),
+            source_entry("object C:\n  def z: String = \"c\"\n"),
+        )]);
+        let mut messages = crate::lsp_input::messages::LspMessageSequence::default();
+        messages.push(hover_message(virtual_uri("C.scala")));
+        crate::lsp_input::LspInput {
+            messages,
+            workspace,
         }
     }
 }

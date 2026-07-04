@@ -41,8 +41,8 @@ use lsp_fuzz::{
     fuzz_target,
     lsp::GeneratorsConfig,
     lsp_input::{
-        LspInputBytesConverter, LspInputGenerator, LspInputMutator, messages::message_mutations,
-        server_response::LspResponseFeedback,
+        JvmLspInputConverter, LspInputBytesConverter, LspInputGenerator, LspInputMutator,
+        messages::message_mutations, server_response::LspResponseFeedback,
     },
     stages::{StatsStage, TimeoutStopStage},
     text_document::text_document_mutations,
@@ -365,7 +365,7 @@ impl FuzzCommand {
 
         let mut fuzzer = StdFuzzerBuilder::new()
             .input_filter(NopInputFilter)
-            .target_bytes_converter(LspInputBytesConverter::new(temp_dir))
+            .target_bytes_converter(JvmLspInputConverter::new(temp_dir))
             .scheduler(QueueScheduler::new())
             .feedback(feedback)
             .objective(objective)

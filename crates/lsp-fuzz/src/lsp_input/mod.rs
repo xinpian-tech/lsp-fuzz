@@ -216,6 +216,51 @@ impl ToTargetBytes<LspInput> for LspInputBytesConverter {
     }
 }
 
+/// Target-bytes converter for the JVM in-process worker.
+///
+/// Unlike [`LspInputBytesConverter`] (which yields a bare LSP wire stream for the native fork
+/// server), this materializes the input's workspace on disk so the embedded language server can read
+/// the source files, and emits a self-describing envelope the worker parses:
+///
+/// ```text
+/// <u32-le rootUriLen><rootUri utf8><localized framed JSON-RPC stream>
+/// ```
+///
+/// The stream is the same localized `initialize … exit` message sequence
+/// [`LspInput::request_bytes`] produces (virtual `lsp-fuzz://` URIs rewritten to the materialized
+/// `file://` workspace). The worker owns `initialize`/`initialized`/`shutdown`/`exit` at epoch scope
+/// and replays the per-input `didOpen`s and stored messages from the same stream, so mutating
+/// `input.messages` or `input.workspace` changes exactly what the real server executes.
+#[derive(Debug, New)]
+pub struct JvmLspInputConverter {
+    workspace_root: PathBuf,
+}
+
+impl ToTargetBytes<LspInput> for JvmLspInputConverter {
+    fn to_target_bytes<'a>(&mut self, input: &'a LspInput) -> OwnedSlice<'a, u8> {
+        let input_hash = input.workspace_hash();
+        let workspace_dir = self
+            .workspace_root
+            .join(format!("{}{input_hash}", LspInput::WORKSPACE_DIR_PREFIX));
+        // Materialize the workspace so the real language server can read the source files. Same
+        // hash -> same directory, so re-materializing an unchanged workspace is idempotent.
+        let _ = std::fs::create_dir_all(&workspace_dir);
+        let _ = input.setup_workspace(&workspace_dir);
+
+        let root_uri = uri::workspace_uri(&workspace_dir)
+            .map(|path| format!("file://{path}"))
+            .unwrap_or_default();
+        let stream = input.request_bytes(&workspace_dir);
+
+        let root_len = u32::try_from(root_uri.len()).unwrap_or(0);
+        let mut envelope = Vec::with_capacity(4 + root_uri.len() + stream.len());
+        envelope.extend_from_slice(&root_len.to_le_bytes());
+        envelope.extend_from_slice(root_uri.as_bytes());
+        envelope.extend_from_slice(&stream);
+        envelope.into()
+    }
+}
+
 impl HasWorkspace for LspInput {
     fn workspace_hash(&self) -> u64 {
         let mut hasher = ahash::AHasher::default();

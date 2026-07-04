@@ -8,98 +8,137 @@ import java.lang.reflect.Proxy;
 import java.nio.channels.Channels;
 import java.nio.channels.Pipe;
 import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 
 /**
  * Real in-process language-server body: embeds {@code ls.core.ScalaLs} inside the worker JVM and
- * drives it over in-memory lsp4j streams, replicating {@code ls.core.Main}'s wiring
- * ({@code LSPLauncher} server launcher + {@code server.connect} + {@code startListening}) but with
- * NIO pipes instead of OS stdio, so the worker fully controls the per-iteration streams.
+ * drives it over in-memory lsp4j streams, replicating {@code ls.core.Main}'s wiring but with NIO
+ * pipes (java.io.Piped* throws "broken pipe" under lsp4j's pool threads). All language-server and
+ * lsp4j types are reached by reflection so the agent still builds and runs the fixture body without
+ * the server on the compile classpath. Selected by {@code COV_ITERATION_BODY=ls}.
  *
- * <p>All language-server and lsp4j types are reached by reflection, so the coverage agent still
- * compiles and runs the fixture body without the language server on the compile classpath. When the
- * worker is launched with the language-server jar on its classpath and {@code COV_ITERATION_BODY=ls}
- * this body is selected; otherwise it is never constructed.
- *
- * <p>Per epoch it initializes the server once. Per input it applies the payload as a Scala document
- * (close the previous document, open the current one), issues a semantic request whose future is
- * tracked through {@link Lifecycle} so quiescence waits for it, and lets the lifecycle attribute the
- * resulting real language-server coverage. Wiring the full serialized fuzzer input (workspace +
- * message sequence) and a BSP-backed index baseline is the Scala execution profile's job; this body
- * establishes the in-process embedding and the real per-input request lifecycle it builds on.
+ * <p>Each run receives the JVM worker envelope
+ * ({@code <u32le rootUriLen><rootUri><localized framed JSON-RPC stream>}) built by
+ * {@code JvmLspInputConverter}: the real fuzzer input, workspace-materialized and URI-localized.
+ * This body parses the framed stream and replays the input's actual messages through lsp4j's
+ * low-level {@code RemoteEndpoint}. The server lifecycle is owned per epoch: {@code
+ * initialize}/{@code initialized} are forwarded once, {@code shutdown}/{@code exit} are skipped. Per
+ * input it closes the documents opened by the previous input, opens the current input's documents,
+ * forwards every stored request (tracked through {@link Lifecycle} so quiescence drains it) and
+ * notification (untracked). Mutating the input's messages or workspace therefore changes exactly
+ * what the real server executes.
  */
 public final class LsIterationBody implements IterationBody {
     private static final long REQUEST_TIMEOUT_MS = 30_000;
-    private static final String DOC_URI = "file:///lsp-fuzz/Input.scala";
 
     private boolean started;
-    private Object textDocumentService; // lsp4j TextDocumentService proxy
-    private Object serverProxy; // lsp4j LanguageServer proxy
-    private int version;
-    private boolean documentOpen;
+    private boolean initializeSent;
+    private boolean initializedSent;
+    private Object endpoint; // org.eclipse.lsp4j.jsonrpc.RemoteEndpoint (implements Endpoint)
+    private final List<String> openDocuments = new ArrayList<>();
 
-    // Cached lsp4j reflection handles, resolved once the server is started.
-    private Class<?> textDocumentItem;
-    private Class<?> didOpenParams;
-    private Class<?> didCloseParams;
-    private Class<?> textDocumentIdentifier;
-    private Class<?> position;
-    private Class<?> hoverParams;
-    private Method didOpen;
-    private Method didClose;
-    private Method hover;
+    // Cached reflection handles.
+    private Method endpointRequest; // Endpoint.request(String, Object) -> CompletableFuture
+    private Method endpointNotify; // Endpoint.notify(String, Object)
+    private Method jsonParse; // JsonParser.parseString(String) -> JsonElement
+    private Method asJsonObject; // JsonElement.getAsJsonObject()
+    private Method objHas; // JsonObject.has(String)
+    private Method objGet; // JsonObject.get(String) -> JsonElement
+    private Method elemAsString; // JsonElement.getAsString()
 
     @Override
     public void run(byte[] payload) {
         ensureStarted();
-        String text = documentText(payload);
-        version++;
+        Envelope env = Envelope.parse(payload);
         try {
-            if (documentOpen) {
-                invoke(textDocumentService, didClose,
-                        newInstance(didCloseParams, new Class<?>[] {textDocumentIdentifier},
-                                newInstance(textDocumentIdentifier, new Class<?>[] {String.class}, DOC_URI)));
-                documentOpen = false;
+            // Per-input document reset: close everything the previous input opened.
+            for (String uri : openDocuments) {
+                notifyServer("textDocument/didClose",
+                        json("{\"textDocument\":{\"uri\":" + quote(uri) + "}}"));
             }
-            Object item = newInstance(textDocumentItem,
-                    new Class<?>[] {String.class, String.class, int.class, String.class},
-                    DOC_URI, "scala", version, text);
-            invoke(textDocumentService, didOpen,
-                    newInstance(didOpenParams, new Class<?>[] {textDocumentItem}, item));
-            documentOpen = true;
+            openDocuments.clear();
 
-            // A real semantic request; its future is tracked so quiescence waits for the server to
-            // finish before the snapshot. Without a build the result may be empty/null — the point
-            // is that real server code runs under this iteration's generation.
-            Object id = newInstance(textDocumentIdentifier, new Class<?>[] {String.class}, DOC_URI);
-            Object pos = newInstance(position, new Class<?>[] {int.class, int.class}, 0, 0);
-            Object params = newInstance(hoverParams,
-                    new Class<?>[] {textDocumentIdentifier, position}, id, pos);
-            Object future = invoke(textDocumentService, hover, params);
-            Lifecycle.track((CompletableFuture<?>) future).get(REQUEST_TIMEOUT_MS, TimeUnit.MILLISECONDS);
+            for (byte[] frame : env.frames) {
+                dispatch(new String(frame, StandardCharsets.UTF_8));
+            }
         } catch (RuntimeException e) {
             throw e;
         } catch (Exception e) {
-            throw new RuntimeException("in-process language-server request failed", e);
+            throw new RuntimeException("replaying the input's LSP sequence failed", e);
         }
     }
 
-    /** Bring up the embedded server once per epoch: wire streams, launchers, and initialize. */
+    /** Forward one JSON-RPC frame, owning the server lifecycle and tracking request futures. */
+    private void dispatch(String body) throws Exception {
+        Object obj = asJsonObject.invoke(jsonParse.invoke(null, body));
+        String method = optString(obj, "method");
+        if (method == null) {
+            return; // a response echoed into the stream (there are none here): ignore
+        }
+        Object params = has(obj, "params") ? get(obj, "params") : null;
+        boolean isRequest = has(obj, "id");
+
+        switch (method) {
+            case "initialize" -> {
+                if (!initializeSent) {
+                    requestAndWait(method, params);
+                    initializeSent = true;
+                }
+            }
+            case "initialized" -> {
+                if (!initializedSent) {
+                    notifyServer(method, params);
+                    initializedSent = true;
+                }
+            }
+            case "shutdown", "exit" -> {
+                // Owned by epoch teardown, never per input — the worker reuses this server.
+            }
+            case "textDocument/didOpen" -> {
+                notifyServer(method, params);
+                String uri = documentUri(params);
+                if (uri != null) {
+                    openDocuments.add(uri);
+                }
+            }
+            default -> {
+                if (isRequest) {
+                    requestAndWait(method, params);
+                } else {
+                    notifyServer(method, params);
+                }
+            }
+        }
+    }
+
+    private void requestAndWait(String method, Object params) throws Exception {
+        Object future = endpointRequest.invoke(endpoint, method, params);
+        Lifecycle.track((CompletableFuture<?>) future).get(REQUEST_TIMEOUT_MS, TimeUnit.MILLISECONDS);
+    }
+
+    private void notifyServer(String method, Object params) throws Exception {
+        endpointNotify.invoke(endpoint, method, params);
+    }
+
+    /** Bring up the embedded server once per epoch: wire streams, launchers, and reflection. */
     private synchronized void ensureStarted() {
         if (started) {
             return;
         }
         try {
-            ClassLoader cl = Thread.currentThread().getContextClassLoader();
-            Class<?> launcher = Class.forName("org.eclipse.lsp4j.launch.LSPLauncher");
+            Class<?> launcherBuilder = Class.forName("org.eclipse.lsp4j.launch.LSPLauncher$Builder");
             Class<?> languageServer = Class.forName("org.eclipse.lsp4j.services.LanguageServer");
             Class<?> languageClient = Class.forName("org.eclipse.lsp4j.services.LanguageClient");
+            Class<?> endpointCls = Class.forName("org.eclipse.lsp4j.jsonrpc.Endpoint");
 
             Object server = newScalaLs();
 
-            // Two NIO pipes: client -> server and server -> client. Real OS pipes, so lsp4j's pool
-            // threads can read/write without the java.io.Piped* writer-liveness "broken pipe" trap.
+            // Real OS pipes: java.io.Piped* trips a "broken pipe" on lsp4j's pool-thread writes.
             Pipe clientToServer = Pipe.open();
             Pipe serverToClient = Pipe.open();
             InputStream serverIn = Channels.newInputStream(clientToServer.source());
@@ -107,43 +146,60 @@ public final class LsIterationBody implements IterationBody {
             InputStream clientIn = Channels.newInputStream(serverToClient.source());
             OutputStream serverOut = Channels.newOutputStream(serverToClient.sink());
 
-            Object serverLauncher = launcher
-                    .getMethod("createServerLauncher", languageServer, InputStream.class, OutputStream.class)
-                    .invoke(null, server, serverIn, serverOut);
-            Object clientProxy = serverLauncher.getClass().getMethod("getRemoteProxy").invoke(serverLauncher);
+            // lsp4j serves every input on one long-lived read-loop thread, so that thread must write
+            // under whatever generation is currently active — it cannot carry a single captured
+            // generation without suppressing later inputs' coverage. Cross-input safety instead comes
+            // from tracking each request future so quiescence drains the server's work within the
+            // input, plus the snapshot/late-watch/pre-reset guards. Detached generation-scoped
+            // background executors belong to the BSP/index profile (task-level follow-up).
+            ExecutorService exec = Executors.newCachedThreadPool(r -> {
+                Thread t = new Thread(r, "lsp-fuzz-ls");
+                t.setDaemon(true);
+                return t;
+            });
+
+            Object serverLauncher = buildLauncher(launcherBuilder, server, languageClient,
+                    serverIn, serverOut, exec);
+            Object clientProxy = serverLauncher.getClass().getMethod("getRemoteProxy")
+                    .invoke(serverLauncher);
             server.getClass().getMethod("connect", languageClient).invoke(server, clientProxy);
             serverLauncher.getClass().getMethod("startListening").invoke(serverLauncher);
 
-            Object localClient = Proxy.newProxyInstance(cl, new Class<?>[] {languageClient},
-                    new PassiveClient());
-            Object clientLauncher = launcher
-                    .getMethod("createClientLauncher", languageClient, InputStream.class, OutputStream.class)
-                    .invoke(null, localClient, clientIn, clientOut);
-            serverProxy = clientLauncher.getClass().getMethod("getRemoteProxy").invoke(clientLauncher);
+            Object passiveClient = Proxy.newProxyInstance(
+                    Thread.currentThread().getContextClassLoader(),
+                    new Class<?>[] {languageClient}, new PassiveClient());
+            Object clientLauncher = buildLauncher(launcherBuilder, passiveClient, languageServer,
+                    clientIn, clientOut, exec);
             clientLauncher.getClass().getMethod("startListening").invoke(clientLauncher);
+            endpoint = clientLauncher.getClass().getMethod("getRemoteEndpoint").invoke(clientLauncher);
 
-            Class<?> initializeParams = Class.forName("org.eclipse.lsp4j.InitializeParams");
-            Object init = invoke(serverProxy,
-                    serverProxy.getClass().getMethod("initialize", initializeParams),
-                    initializeParams.getConstructor().newInstance());
-            Lifecycle.track((CompletableFuture<?>) init).get(REQUEST_TIMEOUT_MS, TimeUnit.MILLISECONDS);
+            endpointRequest = endpointCls.getMethod("request", String.class, Object.class);
+            endpointNotify = endpointCls.getMethod("notify", String.class, Object.class);
 
-            textDocumentService = serverProxy.getClass().getMethod("getTextDocumentService").invoke(serverProxy);
-
-            textDocumentItem = Class.forName("org.eclipse.lsp4j.TextDocumentItem");
-            didOpenParams = Class.forName("org.eclipse.lsp4j.DidOpenTextDocumentParams");
-            didCloseParams = Class.forName("org.eclipse.lsp4j.DidCloseTextDocumentParams");
-            textDocumentIdentifier = Class.forName("org.eclipse.lsp4j.TextDocumentIdentifier");
-            position = Class.forName("org.eclipse.lsp4j.Position");
-            hoverParams = Class.forName("org.eclipse.lsp4j.HoverParams");
-            didOpen = textDocumentService.getClass().getMethod("didOpen", didOpenParams);
-            didClose = textDocumentService.getClass().getMethod("didClose", didCloseParams);
-            hover = textDocumentService.getClass().getMethod("hover", hoverParams);
+            Class<?> jsonParser = Class.forName("com.google.gson.JsonParser");
+            Class<?> jsonElement = Class.forName("com.google.gson.JsonElement");
+            Class<?> jsonObject = Class.forName("com.google.gson.JsonObject");
+            jsonParse = jsonParser.getMethod("parseString", String.class);
+            asJsonObject = jsonElement.getMethod("getAsJsonObject");
+            objHas = jsonObject.getMethod("has", String.class);
+            objGet = jsonObject.getMethod("get", String.class);
+            elemAsString = jsonElement.getMethod("getAsString");
 
             started = true;
         } catch (Exception e) {
             throw new RuntimeException("failed to start the in-process language server", e);
         }
+    }
+
+    private static Object buildLauncher(Class<?> builderCls, Object localService, Class<?> remote,
+            InputStream in, OutputStream out, ExecutorService exec) throws Exception {
+        Object b = builderCls.getConstructor().newInstance();
+        builderCls.getMethod("setLocalService", Object.class).invoke(b, localService);
+        builderCls.getMethod("setRemoteInterface", Class.class).invoke(b, remote);
+        builderCls.getMethod("setInput", InputStream.class).invoke(b, in);
+        builderCls.getMethod("setOutput", OutputStream.class).invoke(b, out);
+        builderCls.getMethod("setExecutorService", ExecutorService.class).invoke(b, exec);
+        return builderCls.getMethod("create").invoke(b);
     }
 
     /** Construct {@code new ScalaLs(ScalaLs.Config())} reflectively (the primary-ctor default). */
@@ -156,22 +212,94 @@ public final class LsIterationBody implements IterationBody {
         return scalaLs.getConstructor(config).newInstance(defaultConfig);
     }
 
-    private static String documentText(byte[] payload) {
-        if (payload == null || payload.length == 0) {
-            return "object Input:\n  def value: Int = 1\n";
-        }
-        return new String(payload, StandardCharsets.UTF_8);
+    private Object json(String text) throws Exception {
+        return jsonParse.invoke(null, text);
     }
 
-    private static Object newInstance(Class<?> type, Class<?>[] sig, Object... args) throws Exception {
-        return type.getConstructor(sig).newInstance(args);
+    private boolean has(Object obj, String key) throws Exception {
+        return (Boolean) objHas.invoke(obj, key);
     }
 
-    private static Object invoke(Object target, Method method, Object... args) {
+    private Object get(Object obj, String key) throws Exception {
+        return objGet.invoke(obj, key);
+    }
+
+    private String optString(Object obj, String key) throws Exception {
+        return has(obj, key) ? (String) elemAsString.invoke(get(obj, key)) : null;
+    }
+
+    /** Extract `params.textDocument.uri` from a didOpen params element, or null. */
+    private String documentUri(Object params) {
         try {
-            return method.invoke(target, args);
+            Object paramsObj = asJsonObject.invoke(params);
+            Object textDoc = asJsonObject.invoke(get(paramsObj, "textDocument"));
+            return (String) elemAsString.invoke(get(textDoc, "uri"));
         } catch (Exception e) {
-            throw new RuntimeException("language-server call " + method.getName() + " failed", e);
+            return null;
+        }
+    }
+
+    private static String quote(String s) {
+        StringBuilder sb = new StringBuilder("\"");
+        for (int i = 0; i < s.length(); i++) {
+            char c = s.charAt(i);
+            if (c == '"' || c == '\\') {
+                sb.append('\\');
+            }
+            sb.append(c);
+        }
+        return sb.append('"').toString();
+    }
+
+    /** The worker envelope: a localized workspace root plus the framed JSON-RPC message stream. */
+    private record Envelope(String rootUri, List<byte[]> frames) {
+        static Envelope parse(byte[] payload) {
+            int rootLen = (payload[0] & 0xff) | (payload[1] & 0xff) << 8
+                    | (payload[2] & 0xff) << 16 | (payload[3] & 0xff) << 24;
+            String rootUri = new String(payload, 4, rootLen, StandardCharsets.UTF_8);
+            int pos = 4 + rootLen;
+            List<byte[]> frames = new ArrayList<>();
+            while (pos < payload.length) {
+                int headerEnd = indexOf(payload, pos);
+                if (headerEnd < 0) {
+                    break;
+                }
+                String headers = new String(payload, pos, headerEnd - pos, StandardCharsets.ISO_8859_1);
+                int len = contentLength(headers);
+                int bodyStart = headerEnd + 4;
+                if (len < 0 || bodyStart + len > payload.length) {
+                    break;
+                }
+                byte[] body = new byte[len];
+                System.arraycopy(payload, bodyStart, body, 0, len);
+                frames.add(body);
+                pos = bodyStart + len;
+            }
+            return new Envelope(rootUri, frames);
+        }
+
+        private static int indexOf(byte[] data, int from) {
+            for (int i = from; i + 3 < data.length; i++) {
+                if (data[i] == '\r' && data[i + 1] == '\n' && data[i + 2] == '\r'
+                        && data[i + 3] == '\n') {
+                    return i;
+                }
+            }
+            return -1;
+        }
+
+        private static int contentLength(String headers) {
+            for (String line : headers.split("\r\n")) {
+                int colon = line.indexOf(':');
+                if (colon > 0 && line.substring(0, colon).trim().equalsIgnoreCase("Content-Length")) {
+                    try {
+                        return Integer.parseInt(line.substring(colon + 1).trim());
+                    } catch (NumberFormatException e) {
+                        return -1;
+                    }
+                }
+            }
+            return -1;
         }
     }
 
