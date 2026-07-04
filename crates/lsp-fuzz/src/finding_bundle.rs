@@ -804,19 +804,50 @@ fn build_cold_replay_frames(
         JsonRPCMessage::notification("initialized".into(), serde_json::json!({})).to_lsp_payload();
     // The steps: generated didOpens + stored messages (filtered by the profile allowlist like the
     // worker), in input order. Each is a request (awaited by id) or a notification (fire-and-forget).
+    // Track the documents opened but not closed, so we can replay the warm worker's end-of-run
+    // `didClose` cleanup below (a crash/logged-fatal/coverage during that cleanup is attributed to the
+    // input, so cold replay must exercise it too or such findings look non-reproducible).
     let mut steps = Vec::new();
+    let mut open_docs: Vec<String> = Vec::new();
     for msg in input.message_sequence() {
         if !is_replayed(msg.method(), profile) {
             continue;
         }
         let before = id;
         let message = msg.into_json_rpc(&mut id, Some(&localize_uri));
+        if let JsonRPCMessage::Notification { method, params, .. } = &message {
+            match method.as_ref() {
+                "textDocument/didOpen" => {
+                    if let Some(uri) = document_uri(params)
+                        && !open_docs.contains(&uri)
+                    {
+                        open_docs.push(uri);
+                    }
+                }
+                "textDocument/didClose" => {
+                    if let Some(uri) = document_uri(params) {
+                        open_docs.retain(|u| u != &uri);
+                    }
+                }
+                _ => {}
+            }
+        }
         let bytes = message.to_lsp_payload();
         // `into_json_rpc` consumed `before` as a request's id and advanced `id`; a notification did not.
         steps.push(match message {
             JsonRPCMessage::Request { .. } => ReplayStep::Request { id: before, bytes },
             _ => ReplayStep::Notification(bytes),
         });
+    }
+    // Mirror the warm worker's end-of-run cleanup: close every still-open document (in open order)
+    // before teardown, so a finding that only manifests during `didClose` reproduces here too.
+    for uri in &open_docs {
+        let close = JsonRPCMessage::notification(
+            "textDocument/didClose".into(),
+            serde_json::json!({ "textDocument": { "uri": uri } }),
+        )
+        .to_lsp_payload();
+        steps.push(ReplayStep::Notification(close));
     }
     // The teardown: a graceful shutdown/exit, sent only after every request step has been answered.
     let mut teardown =
@@ -862,6 +893,17 @@ fn cold_replay_stored_messages(
         .filter(|m| is_replayed(m.method(), profile))
         .cloned()
         .collect()
+}
+
+/// The `textDocument.uri` of a `didOpen`/`didClose` notification's params, if present — used to track
+/// which documents the replayed sequence leaves open so cold replay can mirror the warm worker's
+/// end-of-run `didClose` cleanup.
+fn document_uri(params: &serde_json::Value) -> Option<String> {
+    params
+        .get("textDocument")?
+        .get("uri")?
+        .as_str()
+        .map(ToString::to_string)
 }
 
 /// Parse every complete `Content-Length`-framed LSP payload from `bytes` (stopping at the first
@@ -1468,6 +1510,82 @@ mod tests {
             ("textDocument/references".to_string(), true)
         );
         assert!(matches!(frames.steps[0], ReplayStep::Request { id: 1, .. }));
+    }
+
+    /// An input with a source file is auto-`didOpen`ed; cold replay must mirror the warm worker's
+    /// end-of-run cleanup by emitting a `didClose` for it (with the SAME localized URI) after the
+    /// steps and before teardown, so a finding that only manifests during cleanup reproduces.
+    #[test]
+    fn cold_replay_closes_opened_documents_before_teardown() {
+        use crate::{
+            file_system::{FileSystemDirectory, FileSystemEntry},
+            lsp_input::{WorkspaceEntry, messages::LspMessageSequence},
+            text_document::TextDocument,
+            utf8::Utf8Input,
+        };
+        use lsp_fuzz_grammars::Language;
+
+        let mut doc = TextDocument::new(Language::Scala, "object A:\n  def x = 1\n".into());
+        doc.update_metadata();
+        let input = LspInput {
+            messages: LspMessageSequence::default(),
+            workspace: FileSystemDirectory::from([(
+                Utf8Input::new("main.scala".to_owned()),
+                FileSystemEntry::File(WorkspaceEntry::SourceFile(doc)),
+            )]),
+        };
+        let profile = ScalaExecutionProfile::presentation_compiler();
+        let dir = tempfile::tempdir().unwrap();
+        let stream = build_cold_replay_stream(&input, &profile, "file:///root", dir.path());
+        let msgs = parse_lsp_payloads(&stream);
+        let method_order: Vec<String> = msgs
+            .iter()
+            .filter_map(|m| match m {
+                JsonRPCMessage::Request { method, .. }
+                | JsonRPCMessage::Notification { method, .. } => Some(method.to_string()),
+                JsonRPCMessage::Response { .. } => None,
+            })
+            .collect();
+
+        let open_at = method_order
+            .iter()
+            .position(|m| m == "textDocument/didOpen")
+            .expect("the source file is opened");
+        let close_at = method_order
+            .iter()
+            .position(|m| m == "textDocument/didClose")
+            .expect("the opened document is closed before teardown");
+        let shutdown_at = method_order
+            .iter()
+            .position(|m| m == "shutdown")
+            .expect("teardown present");
+        assert!(
+            open_at < close_at && close_at < shutdown_at,
+            "expected didOpen < didClose < shutdown, got {method_order:?}"
+        );
+
+        // The didClose targets the SAME localized URI the didOpen used (so the server closes the doc
+        // it opened, exactly like the warm worker).
+        let open_uri = msgs.iter().find_map(|m| match m {
+            JsonRPCMessage::Notification { method, params, .. }
+                if method == "textDocument/didOpen" =>
+            {
+                document_uri(params)
+            }
+            _ => None,
+        });
+        let close_uri = msgs.iter().find_map(|m| match m {
+            JsonRPCMessage::Notification { method, params, .. }
+                if method == "textDocument/didClose" =>
+            {
+                document_uri(params)
+            }
+            _ => None,
+        });
+        assert!(
+            open_uri.is_some() && open_uri == close_uri,
+            "close must target the opened URI"
+        );
     }
 
     /// Only index mode brings up the async BSP/index bootstrap whose readiness the server logs, so
