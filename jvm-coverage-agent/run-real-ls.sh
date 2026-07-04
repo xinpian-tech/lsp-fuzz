@@ -82,8 +82,11 @@ send_obj() {
 run_epoch() {
   local n="$1" cwd="$2" wsRoot="$3" docUri="$4" docText="$5" driveCompile="$6"
   local dir ctl; dir=$(mktemp -d); ctl="$dir/ctl"; mkfifo "$ctl"
+  # `--in-process-pc`: the current LS forks the presentation compiler into a child JVM by default
+  # (production isolation), which the main-JVM coverage agent cannot instrument; run it in-process so
+  # the agent observes `dotty.tools.pc.*` reach.
   ( cd "$cwd" && COV_MAP_PATH="$here/ls-map-$n.bin" COV_CLASSES_PATH="$here/ls-classes-$n.txt" \
-      "$java" "${flags[@]}" -jar "$LS_JAR" < "$ctl" > "$here/ls-out-$n.log" 2>&1 ) &
+      "$java" "${flags[@]}" -jar "$LS_JAR" --in-process-pc < "$ctl" > "$here/ls-out-$n.log" 2>&1 ) &
   local lspid=$!
   exec 3>"$ctl"
   if [ -z "$wsRoot" ]; then

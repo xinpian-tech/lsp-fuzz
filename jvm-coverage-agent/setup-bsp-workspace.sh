@@ -18,6 +18,11 @@ import mill.*
 import mill.scalalib.*
 object app extends ScalaModule {
   def scalaVersion = "3.3.4"
+  // The current LS requires every source to be compiled with `-Xsemanticdb`; without it the server
+  // rejects requests ("has no SemanticDB output") and the compile is "skipped: no indexable targets",
+  // so the presentation compiler never engages. Emitting SemanticDB makes the BSP compile indexable
+  // and lets the PC serve completion/hover, reaching `dotty.tools.pc.*`.
+  def scalacOptions = Seq("-Xsemanticdb")
 }
 EOF
 cat > "$WS/app/src/Foo.scala" <<'EOF'
