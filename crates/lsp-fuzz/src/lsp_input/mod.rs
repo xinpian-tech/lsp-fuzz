@@ -35,6 +35,7 @@ use crate::{
 
 pub type FileContentInput = BytesInput;
 
+pub mod materializer;
 pub mod message_edit;
 pub mod messages;
 pub mod ops_curiosity;
@@ -235,49 +236,58 @@ impl ToTargetBytes<LspInput> for LspInputBytesConverter {
 /// (`initialize`/`initialized`/`shutdown`/`exit`) and replays the per-input `didOpen`s and stored
 /// messages from that stream, so mutating `input.messages`/`input.workspace` changes exactly what the
 /// real server executes.
-#[derive(Debug, New)]
+#[derive(Debug)]
 pub struct JvmLspInputConverter {
-    workspace_root: PathBuf,
     profile: ScalaExecutionProfile,
+    materializer: Box<dyn materializer::WorkspaceMaterializer>,
+}
+
+impl JvmLspInputConverter {
+    /// Build the converter for `profile`, choosing the materializer by mode: the presentation
+    /// compiler uses a generic temp root under `workspace_root`; the index mode overlays a verified
+    /// backdrop taken from `BACKDROP_OUT` (falling back to `workspace_root` if unset — the profile's
+    /// environment validation rejects a missing/invalid backdrop before this point).
+    #[must_use]
+    pub fn new(workspace_root: PathBuf, profile: ScalaExecutionProfile) -> Self {
+        use crate::execution::scala_profile::ScalaProfileMode;
+        let materializer: Box<dyn materializer::WorkspaceMaterializer> = match profile.mode() {
+            ScalaProfileMode::PresentationCompiler => Box::new(
+                materializer::GenericTempRootMaterializer::new(workspace_root),
+            ),
+            ScalaProfileMode::Index => {
+                let backdrop = std::env::var_os("BACKDROP_OUT")
+                    .map(PathBuf::from)
+                    .unwrap_or(workspace_root);
+                Box::new(materializer::BackdropOverlayMaterializer::new(backdrop))
+            }
+        };
+        Self {
+            profile,
+            materializer,
+        }
+    }
 }
 
 impl ToTargetBytes<LspInput> for JvmLspInputConverter {
     fn to_target_bytes<'a>(&mut self, input: &'a LspInput) -> OwnedSlice<'a, u8> {
-        let input_hash = input.workspace_hash();
-        let workspace_dir = self
-            .workspace_root
-            .join(format!("{}{input_hash}", LspInput::WORKSPACE_DIR_PREFIX));
-        // Materialize the workspace so the real language server can read the source files. Same
-        // hash -> same directory, so re-materializing an unchanged workspace is idempotent. A
-        // materialization failure must not silently replay an input against a missing workspace
+        // Materialization failure must not silently replay an input against a missing workspace
         // (`ToTargetBytes` cannot return an error), so fail loudly with context.
-        std::fs::create_dir_all(&workspace_dir).unwrap_or_else(|e| {
-            panic!(
-                "failed to create JVM workspace dir {}: {e}",
-                workspace_dir.display()
-            )
-        });
-        input.setup_workspace(&workspace_dir).unwrap_or_else(|e| {
-            panic!(
-                "failed to materialize JVM workspace {}: {e}",
-                workspace_dir.display()
-            )
-        });
+        let placed = self
+            .materializer
+            .materialize(input)
+            .unwrap_or_else(|e| panic!("failed to materialize the JVM workspace: {e}"));
 
-        // The epoch is initialized once against a STABLE root — the temp workspace root that
-        // contains every per-input `lsp-fuzz-workspace_<hash>` subdirectory — so every input's
-        // documents live under the initialized root even though `initialize` is sent only once.
-        let root_uri = uri::workspace_uri(&self.workspace_root)
-            .map(|path| format!("file://{path}"))
-            .unwrap_or_default();
-        let init_params = self.profile.initialize_params(&root_uri).to_string();
+        // The epoch is initialized once against the materializer's root, so every input's documents
+        // (localized under it) live inside the initialized root even though `initialize` is sent
+        // only once.
+        let init_params = self.profile.initialize_params(&placed.root_uri).to_string();
         let allowed_methods = self.profile.allowed_methods().join("\n");
-        let stream = input.request_bytes(&workspace_dir);
+        let stream = input.request_bytes(&placed.localization_dir);
 
         let mut envelope = Vec::with_capacity(
-            12 + root_uri.len() + init_params.len() + allowed_methods.len() + stream.len(),
+            12 + placed.root_uri.len() + init_params.len() + allowed_methods.len() + stream.len(),
         );
-        push_length_prefixed(&mut envelope, root_uri.as_bytes());
+        push_length_prefixed(&mut envelope, placed.root_uri.as_bytes());
         push_length_prefixed(&mut envelope, init_params.as_bytes());
         push_length_prefixed(&mut envelope, allowed_methods.as_bytes());
         envelope.extend_from_slice(&stream);
@@ -510,7 +520,18 @@ mod tests {
             "the framed LSP stream must follow the header sections"
         );
 
-        // Index profile: the allowlist differs (references / workspace-symbol enabled).
+        // Index profile: the allowlist differs (references / workspace-symbol enabled). Index mode
+        // materializes against a verified backdrop root, so seed `tmp` (its fallback root when
+        // BACKDROP_OUT is unset) with the frozen backdrop markers.
+        std::fs::write(tmp.path().join("backdrop-metadata.json"), b"{}").unwrap();
+        std::fs::create_dir_all(tmp.path().join("bsp")).unwrap();
+        std::fs::write(tmp.path().join("bsp").join("mill-bsp.json"), b"{}").unwrap();
+        std::fs::create_dir_all(tmp.path().join("semanticdb")).unwrap();
+        std::fs::write(
+            tmp.path().join("semanticdb").join("A.scala.semanticdb"),
+            b"x",
+        )
+        .unwrap();
         let mut index =
             JvmLspInputConverter::new(tmp.path().to_path_buf(), ScalaExecutionProfile::index());
         let bytes = index.to_target_bytes(&input);
