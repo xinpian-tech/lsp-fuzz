@@ -456,10 +456,30 @@ fn drive_replay_writes<W: Write>(
     let remaining = || deadline_at.saturating_duration_since(Instant::now());
     let _ = writer.write_all(&frames.handshake);
     let _ = writer.flush();
-    let _ = ready_rx.recv_timeout(remaining());
     // Track which response ids have arrived (a later one may precede the request currently awaited),
     // so awaiting an id already seen returns immediately.
     let mut seen = std::collections::HashSet::new();
+    if frames.wait_for_bsp_ready {
+        // Index mode: the async BSP/index bootstrap logs a readiness marker on stderr; wait for it so
+        // requests do not race the bootstrap into a spurious `-32803 "workspace is not ready"`.
+        let _ = ready_rx.recv_timeout(remaining());
+    } else {
+        // PC mode: no BSP bootstrap marker is ever printed, so waiting for it would burn the whole
+        // deadline. Instead mirror the warm worker's `ensureInitialized` (which awaits the initialize
+        // future) by awaiting the `initialize` response (id 0) before sending any request.
+        while !seen.contains(&COLD_REPLAY_INITIALIZE_ID) {
+            let wait = remaining();
+            if wait.is_zero() {
+                break;
+            }
+            match resp_id_rx.recv_timeout(wait) {
+                Ok(rid) => {
+                    seen.insert(rid);
+                }
+                Err(_) => break,
+            }
+        }
+    }
     for step in &frames.steps {
         let _ = writer.write_all(step.bytes());
         let _ = writer.flush();
@@ -739,6 +759,12 @@ struct ColdReplayFrames {
     /// expired) — the worker never tears the server down mid-request, so tearing down while a request
     /// is still in flight would drop its response and lose the finding.
     teardown: Vec<u8>,
+    /// Whether to wait for the BSP/index bootstrap readiness marker on stderr before replaying steps.
+    /// Only index mode brings up the async BSP/index (whose readiness the server logs); a PC-mode
+    /// server never prints that marker, so PC mode must NOT wait for it (else the whole deadline is
+    /// spent waiting and the run is misclassified as a timeout). PC readiness is the `initialize`
+    /// response instead (awaited via the response barrier).
+    wait_for_bsp_ready: bool,
 }
 
 /// Split the cold-replay stream into [`ColdReplayFrames`] so the driver can stage the writes: send the
@@ -793,6 +819,8 @@ fn build_cold_replay_frames(
         handshake,
         steps,
         teardown,
+        // Only index mode brings up the async BSP/index bootstrap whose readiness the server logs.
+        wait_for_bsp_ready: profile.mode() == ScalaProfileMode::Index,
     }
 }
 
@@ -1212,9 +1240,15 @@ mod tests {
     fn replay_script(script: &str, timeout: Duration) -> OutcomeClass {
         let profile = ScalaExecutionProfile::presentation_compiler();
         let temp = tempfile::tempdir().unwrap();
-        // Emit the bootstrap-ready marker first so the handshake barrier releases immediately; the
-        // marker text triggers no classification rule, so it does not affect what the script tests.
-        let script = format!("echo '{LS_BOOTSTRAP_READY_MARKER}' >&2; {script}");
+        // PC replay waits for the `initialize` response (id 0), not the BSP stderr marker, so the
+        // fake server must emit that framed response first (a real PC server does). Its `{}` result
+        // triggers no classification rule, so it does not affect what the script tests.
+        let init_response =
+            JsonRPCMessage::response(Some(0usize), Some(serde_json::json!({})), None)
+                .to_lsp_payload();
+        let resp_file = temp.path().join("init-response.bin");
+        std::fs::write(&resp_file, &init_response).unwrap();
+        let script = format!("cat {}; {}", resp_file.display(), script);
         let config = ColdReplayConfig {
             profile: &profile,
             program: "sh".to_string(),
@@ -1428,6 +1462,34 @@ mod tests {
         assert!(matches!(frames.steps[0], ReplayStep::Request { id: 1, .. }));
     }
 
+    /// Only index mode brings up the async BSP/index bootstrap whose readiness the server logs, so
+    /// only index frames wait for it. A PC-mode server never prints the marker; waiting for it would
+    /// spend the entire replay deadline and misclassify the run as a timeout.
+    #[test]
+    fn only_index_frames_wait_for_bsp_readiness() {
+        let dir = tempfile::tempdir().unwrap();
+        let pc = build_cold_replay_frames(
+            &LspInput::default(),
+            &ScalaExecutionProfile::presentation_compiler(),
+            "file:///root",
+            dir.path(),
+        );
+        let index = build_cold_replay_frames(
+            &LspInput::default(),
+            &ScalaExecutionProfile::index(),
+            "file:///root",
+            dir.path(),
+        );
+        assert!(
+            !pc.wait_for_bsp_ready,
+            "PC replay must not wait for the BSP readiness marker"
+        );
+        assert!(
+            index.wait_for_bsp_ready,
+            "index replay must wait for the BSP readiness marker"
+        );
+    }
+
     #[test]
     fn response_ids_extracts_only_numeric_response_ids_in_order() {
         let mut bytes = JsonRPCMessage::response(Some(2usize), None, None).to_lsp_payload();
@@ -1516,7 +1578,9 @@ mod tests {
 
         let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let mut writer = RecordingWriter(buf.clone());
-        let (ready_tx, ready_rx) = channel::<()>();
+        // PC mode does not wait for the BSP stderr marker, so `ready_tx` stays unused here; PC
+        // readiness is the `initialize` response (id 0), delivered on `resp_tx` below.
+        let (_ready_tx, ready_rx) = channel::<()>();
         let (resp_tx, resp_rx) = channel::<usize>();
         let driver = std::thread::spawn(move || {
             drive_replay_writes(
@@ -1545,7 +1609,8 @@ mod tests {
             v.iter().any(|(mm, ii)| mm == m && *ii == id)
         };
 
-        // (a) Before readiness the driver has only written the handshake (initialize + initialized).
+        // (a) Before readiness the driver has only written the handshake (initialize + initialized);
+        //     PC readiness is the initialize response (id 0), which has not been delivered yet.
         wait_until(&|v| has(v, "initialized", None), "handshake written");
         {
             let v = written_requests(&buf.lock().unwrap());
@@ -1556,9 +1621,9 @@ mod tests {
             );
         }
 
-        // (b) After readiness the driver writes ONLY request id 1 and then blocks awaiting its response
-        //     — request id 2 and shutdown/exit must be absent.
-        ready_tx.send(()).unwrap();
+        // (b) After the initialize response (id 0) arrives, the driver writes ONLY request id 1 and
+        //     then blocks awaiting its response — request id 2 and shutdown/exit must be absent.
+        resp_tx.send(0).unwrap();
         wait_until(
             &|v| has(v, "textDocument/hover", Some(1)),
             "request id 1 written",

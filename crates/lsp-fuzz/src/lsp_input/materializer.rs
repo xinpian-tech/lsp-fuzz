@@ -59,6 +59,12 @@ pub struct GenericTempRootMaterializer {
 
 impl WorkspaceMaterializer for GenericTempRootMaterializer {
     fn materialize(&self, input: &LspInput) -> io::Result<Materialized> {
+        // The server initializes at `workspace_root` and sees every file beneath it, and the JVM
+        // executor has no post-exec workspace cleanup. Remove any prior per-input workspace dir here
+        // before writing this input's, so the initialized root reflects only the current input —
+        // otherwise earlier inputs' files accumulate under the root and a warm-fuzzer finding may not
+        // reproduce in a fresh cold replay. Only our own `lsp-fuzz-workspace_*` dirs are removed.
+        remove_prefixed_workspace_dirs(&self.workspace_root)?;
         let dir = self.workspace_root.join(format!(
             "{}{}",
             LspInput::WORKSPACE_DIR_PREFIX,
@@ -71,6 +77,29 @@ impl WorkspaceMaterializer for GenericTempRootMaterializer {
             localization_dir: dir,
         })
     }
+}
+
+/// Remove any existing `lsp-fuzz-workspace_*` per-input directories directly under `root`, leaving
+/// all other content untouched, so the initialized root reflects only the input about to be written.
+/// A missing root is not an error (nothing to clean).
+fn remove_prefixed_workspace_dirs(root: &Path) -> io::Result<()> {
+    let entries = match std::fs::read_dir(root) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e),
+    };
+    for entry in entries {
+        let entry = entry?;
+        let is_workspace_dir = entry.file_type().is_ok_and(|t| t.is_dir())
+            && entry
+                .file_name()
+                .to_str()
+                .is_some_and(|name| name.starts_with(LspInput::WORKSPACE_DIR_PREFIX));
+        if is_workspace_dir {
+            std::fs::remove_dir_all(entry.path())?;
+        }
+    }
+    Ok(())
 }
 
 /// Keeps a verified, immutable pre-indexed backdrop root and writes only the input's files as a
@@ -157,6 +186,53 @@ mod tests {
         assert_eq!(out.root_uri, format!("file://{}/", tmp.path().display()));
         assert!(out.localization_dir.starts_with(tmp.path()));
         assert!(out.localization_dir.join("main.scala").is_file());
+    }
+
+    /// Materializing a new input removes the previous input's per-input workspace dir, so the
+    /// initialized root holds only the current input (no stale files from earlier inputs that could
+    /// make a warm-fuzzer finding fail to reproduce in a fresh cold replay).
+    #[test]
+    fn generic_materializer_removes_stale_workspace_dirs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let m = GenericTempRootMaterializer::new(tmp.path().to_path_buf());
+
+        let out_a = m.materialize(&scala_input()).unwrap();
+        assert!(out_a.localization_dir.join("main.scala").is_file());
+
+        // A different input → a different per-input dir hash. Materializing it must remove A's dir.
+        let mut b_doc = TextDocument::new(Language::Scala, "object B:\n  def y = 2\n".into());
+        b_doc.update_metadata();
+        let input_b = LspInput {
+            messages: LspMessageSequence::default(),
+            workspace: FileSystemDirectory::from([(
+                Utf8Input::new("other.scala".to_owned()),
+                FileSystemEntry::File(WorkspaceEntry::SourceFile(b_doc)),
+            )]),
+        };
+        let out_b = m.materialize(&input_b).unwrap();
+
+        assert_ne!(
+            out_a.localization_dir, out_b.localization_dir,
+            "different inputs must use different per-input dirs"
+        );
+        assert!(
+            !out_a.localization_dir.exists(),
+            "the previous input's workspace dir must be removed before the next is written"
+        );
+        assert!(out_b.localization_dir.join("other.scala").is_file());
+        let remaining = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|e| {
+                e.file_name()
+                    .to_str()
+                    .is_some_and(|n| n.starts_with(LspInput::WORKSPACE_DIR_PREFIX))
+            })
+            .count();
+        assert_eq!(
+            remaining, 1,
+            "only the current input's workspace dir remains"
+        );
     }
 
     fn write_frozen_backdrop(root: &Path) {
