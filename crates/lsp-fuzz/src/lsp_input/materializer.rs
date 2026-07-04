@@ -50,22 +50,38 @@ fn file_uri(dir: &Path) -> String {
         .unwrap_or_default()
 }
 
-/// Writes the full input workspace under `<workspace_root>/lsp-fuzz-workspace_<hash>` and
-/// initializes at `workspace_root` (every per-input directory is inside it).
+/// Writes the full input workspace under a PER-RUN subdirectory of `workspace_root`
+/// (`<workspace_root>/lsp-fuzz-run-<pid>/lsp-fuzz-workspace_<hash>`) and initializes at that per-run
+/// subdirectory. The per-run subdir isolates this process from a concurrent lsp-fuzz run that shares
+/// the same temp root (the default `/tmp` or a shared `--temp-dir`): the per-input cleanup only ever
+/// touches this run's own directories, and the server only sees this run's current input.
 #[derive(Debug, New)]
 pub struct GenericTempRootMaterializer {
     workspace_root: PathBuf,
 }
 
+impl GenericTempRootMaterializer {
+    /// This process's per-run subdirectory under the (possibly shared) temp root. Keyed by pid so two
+    /// concurrent lsp-fuzz processes never share it — cleanup then cannot delete another campaign's
+    /// live workspaces.
+    fn run_root(&self) -> PathBuf {
+        self.workspace_root
+            .join(format!("lsp-fuzz-run-{}", std::process::id()))
+    }
+}
+
 impl WorkspaceMaterializer for GenericTempRootMaterializer {
     fn materialize(&self, input: &LspInput) -> io::Result<Materialized> {
-        // The server initializes at `workspace_root` and sees every file beneath it, and the JVM
-        // executor has no post-exec workspace cleanup. Remove any prior per-input workspace dir here
-        // before writing this input's, so the initialized root reflects only the current input —
-        // otherwise earlier inputs' files accumulate under the root and a warm-fuzzer finding may not
-        // reproduce in a fresh cold replay. Only our own `lsp-fuzz-workspace_*` dirs are removed.
-        remove_prefixed_workspace_dirs(&self.workspace_root)?;
-        let dir = self.workspace_root.join(format!(
+        // Everything lives under this run's own subdirectory. The server initializes at the per-run
+        // subdir and sees every file beneath it, and the JVM executor has no post-exec cleanup, so
+        // remove any prior per-input workspace dir here before writing this input's — the initialized
+        // root then reflects only the current input (otherwise earlier inputs' files accumulate and a
+        // warm-fuzzer finding may not reproduce in a fresh cold replay). Cleanup is scoped to the
+        // per-run subdir, so a concurrent run sharing the temp root is never touched.
+        let run_root = self.run_root();
+        std::fs::create_dir_all(&run_root)?;
+        remove_prefixed_workspace_dirs(&run_root)?;
+        let dir = run_root.join(format!(
             "{}{}",
             LspInput::WORKSPACE_DIR_PREFIX,
             input.workspace_hash()
@@ -73,7 +89,7 @@ impl WorkspaceMaterializer for GenericTempRootMaterializer {
         std::fs::create_dir_all(&dir)?;
         input.setup_workspace(&dir)?;
         Ok(Materialized {
-            root_uri: file_uri(&self.workspace_root),
+            root_uri: file_uri(&run_root),
             localization_dir: dir,
         })
     }
@@ -175,16 +191,21 @@ mod tests {
         }
     }
 
-    /// The generic materializer keeps the previous behavior: workspace under a per-input dir in the
-    /// temp root, initialized at the temp root.
+    /// The generic materializer writes the input under a PER-RUN subdirectory of the temp root and
+    /// initializes at that subdir (so a concurrent run sharing the temp root is isolated), with the
+    /// input's files inside it.
     #[test]
-    fn generic_materializer_uses_temp_root() {
+    fn generic_materializer_uses_a_per_run_subdir_of_the_temp_root() {
         let tmp = tempfile::tempdir().unwrap();
         let m = GenericTempRootMaterializer::new(tmp.path().to_path_buf());
         let input = scala_input();
         let out = m.materialize(&input).unwrap();
-        assert_eq!(out.root_uri, format!("file://{}/", tmp.path().display()));
-        assert!(out.localization_dir.starts_with(tmp.path()));
+        let run_root = tmp
+            .path()
+            .join(format!("lsp-fuzz-run-{}", std::process::id()));
+        // The initialized root is this run's own subdir under the temp root, not the shared temp root.
+        assert_eq!(out.root_uri, format!("file://{}/", run_root.display()));
+        assert!(out.localization_dir.starts_with(&run_root));
         assert!(out.localization_dir.join("main.scala").is_file());
     }
 
@@ -220,7 +241,12 @@ mod tests {
             "the previous input's workspace dir must be removed before the next is written"
         );
         assert!(out_b.localization_dir.join("other.scala").is_file());
-        let remaining = std::fs::read_dir(tmp.path())
+        // Only the current input's workspace dir remains — counted within THIS run's subdir (cleanup
+        // is scoped there, never the shared temp root).
+        let run_root = tmp
+            .path()
+            .join(format!("lsp-fuzz-run-{}", std::process::id()));
+        let remaining = std::fs::read_dir(&run_root)
             .unwrap()
             .filter_map(Result::ok)
             .filter(|e| {
@@ -232,6 +258,27 @@ mod tests {
         assert_eq!(
             remaining, 1,
             "only the current input's workspace dir remains"
+        );
+    }
+
+    /// Cleanup is scoped to this run's own subdir: a `lsp-fuzz-workspace_*` directory placed directly
+    /// under the SHARED temp root (as if owned by a concurrent lsp-fuzz process) is NOT deleted.
+    #[test]
+    fn generic_materializer_does_not_delete_a_concurrent_runs_workspaces() {
+        let tmp = tempfile::tempdir().unwrap();
+        // A sibling campaign's workspace under the shared temp root.
+        let other = tmp
+            .path()
+            .join(format!("{}deadbeef", LspInput::WORKSPACE_DIR_PREFIX));
+        std::fs::create_dir_all(&other).unwrap();
+        std::fs::write(other.join("their.scala"), b"object Theirs\n").unwrap();
+
+        let m = GenericTempRootMaterializer::new(tmp.path().to_path_buf());
+        let _ = m.materialize(&scala_input()).unwrap();
+
+        assert!(
+            other.join("their.scala").is_file(),
+            "a concurrent run's workspace under the shared temp root must not be deleted"
         );
     }
 
