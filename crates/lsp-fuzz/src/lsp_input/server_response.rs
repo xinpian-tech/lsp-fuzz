@@ -88,6 +88,8 @@ where
         let Ok(matching) = matching::RequestResponseMatching::match_messages(
             input.messages.iter(),
             received_messages.iter(),
+            // Native fork-server path: no frozen backdrop, so only workspace/overlay URIs are lifted.
+            None,
         ) else {
             warn!("Failed to match messages");
             return Ok(());

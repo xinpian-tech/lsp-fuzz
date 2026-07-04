@@ -223,21 +223,23 @@ fn localize_json_value(value: &mut serde_json::Value, workspace_uri: &str) {
     }
 }
 
-pub(crate) fn lift_localized_json(value: &mut serde_json::Value) {
+/// Rewrite every localized `file://` URI string in a JSON-RPC value back into the virtual
+/// `lsp-fuzz://` form, using the single shared lifting policy
+/// ([`crate::lsp_input::uri::lift_localized_str`]) so the response path and diagnostics agree.
+/// `backdrop_root`, when set (index mode), scopes frozen backdrop-source lifting to that root.
+pub(crate) fn lift_localized_json(value: &mut serde_json::Value, backdrop_root: Option<&str>) {
     use serde_json::Value::{Array, Object, String};
     match value {
         Object(inner) => inner.values_mut().for_each(|value| {
-            lift_localized_json(value);
+            lift_localized_json(value, backdrop_root);
         }),
         Array(items) => items.iter_mut().for_each(|value| {
-            lift_localized_json(value);
+            lift_localized_json(value, backdrop_root);
         }),
         String(str_val) => {
-            if let Some(index) = str_val.find(LspInput::WORKSPACE_DIR_PREFIX) {
-                let next_slash = str_val[index..]
-                    .find('/')
-                    .map_or(str_val.len(), |it| it + index + 1);
-                str_val.replace_range(0..next_slash, LspInput::PROTOCOL_PREFIX);
+            if let Some(lifted) = crate::lsp_input::uri::lift_localized_str(str_val, backdrop_root)
+            {
+                *str_val = lifted;
             }
         }
         _ => {}
@@ -312,7 +314,7 @@ mod tests {
             ],
             "other_arr": [{ "uri": "file:///path/to/lsp-fuzz-workspace_2333/path/to/element" }]
         });
-        super::lift_localized_json(&mut value);
+        super::lift_localized_json(&mut value, None);
         assert_eq!(
             value,
             serde_json::json!({
@@ -321,6 +323,34 @@ mod tests {
                 "some_arr": ["lsp-fuzz://path/to/element", "lsp-fuzz://", "lsp-fuzz://"],
                 "other_arr": [{ "uri": "lsp-fuzz://path/to/element" }]
             })
+        );
+    }
+
+    /// A workspace-symbol/references-style result carrying both a frozen backdrop source URI and an
+    /// overlay URI: with the backdrop root supplied, both lift into the virtual model; an unrelated
+    /// `sources/` path stays raw. Regression for the JSON response lifting path.
+    #[test]
+    fn test_lift_localized_json_backdrop_and_overlay() {
+        let mut value = serde_json::json!({
+            "locations": [
+                { "uri": "file:///verified-backdrop/sources/rvdecoderdb/X.scala" },
+                { "uri": "file:///verified-backdrop/.lsp-fuzz-overlay/lsp-fuzz-workspace_9/main.scala" },
+                { "uri": "file:///elsewhere/sources/Unrelated.scala" }
+            ]
+        });
+        super::lift_localized_json(&mut value, Some("/verified-backdrop"));
+        assert_eq!(
+            value["locations"][0]["uri"],
+            serde_json::json!("lsp-fuzz://backdrop/sources/rvdecoderdb/X.scala")
+        );
+        assert_eq!(
+            value["locations"][1]["uri"],
+            serde_json::json!("lsp-fuzz://main.scala")
+        );
+        // Not under the backdrop root: left untouched (generic model preserved).
+        assert_eq!(
+            value["locations"][2]["uri"],
+            serde_json::json!("file:///elsewhere/sources/Unrelated.scala")
         );
     }
 }

@@ -31,9 +31,12 @@ impl<'a> RequestResponseMatching<'a> {
         self.responses.get(request)
     }
 
+    /// `backdrop_root`, when set (Scala index mode), scopes frozen backdrop-source URI lifting to
+    /// that root; the native path passes `None` (workspace/overlay lifting only).
     pub(crate) fn match_messages<'rec>(
         sent_messages: impl Iterator<Item = &'a LspMessage>,
         received_messages: impl Iterator<Item = &'rec JsonRPCMessage>,
+        backdrop_root: Option<&str>,
     ) -> Result<Self, MessageDecodeError> {
         let mut responses = HashMap::new();
         let mut notifications = Vec::new();
@@ -50,13 +53,13 @@ impl<'a> RequestResponseMatching<'a> {
             match recv {
                 JsonRPCMessage::Request { method, params, .. } => {
                     let mut params = params.clone();
-                    lift_localized_json(&mut params);
+                    lift_localized_json(&mut params, backdrop_root);
                     let request = LspMessage::try_from_json(method, params)?;
                     requests_from_server.push(request);
                 }
                 JsonRPCMessage::Notification { method, params, .. } => {
                     let mut params = params.clone();
-                    lift_localized_json(&mut params);
+                    lift_localized_json(&mut params, backdrop_root);
                     let notification = LspMessage::try_from_json(method, params)?;
                     notifications.push(notification);
                 }
@@ -69,7 +72,7 @@ impl<'a> RequestResponseMatching<'a> {
                     if let Some(msg) = requests.get(id).copied() {
                         if let Some(result) = result {
                             let mut result = result.clone();
-                            lift_localized_json(&mut result);
+                            lift_localized_json(&mut result, backdrop_root);
                             let response = LspResponse::try_from_json(msg.method(), result)?;
                             responses.insert(msg, response);
                         } else if let Some(error) = error {

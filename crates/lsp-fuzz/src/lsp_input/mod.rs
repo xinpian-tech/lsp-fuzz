@@ -446,10 +446,11 @@ mod tests {
         // When lifting the URI
         let lifted = LspInput::lift_uri(&uri);
 
-        // Then the result has fuzzer protocol prefix and workspace path
+        // Then the result has the fuzzer protocol prefix and the workspace-relative path (the
+        // canonical `lsp-fuzz://<rel>` form produced by `virtual_uri_for_path`).
         assert_eq!(
             lifted.as_str(),
-            format!("{}/abc/file.rs", LspInput::PROTOCOL_PREFIX)
+            format!("{}abc/file.rs", LspInput::PROTOCOL_PREFIX)
         );
 
         // Given a URI without workspace prefix
