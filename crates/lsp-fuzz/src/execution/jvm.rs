@@ -417,6 +417,11 @@ pub enum WorkerError {
     Io(#[from] io::Error),
     #[error("worker control protocol error")]
     Protocol,
+    /// The worker process's output stream closed before a reply — the JVM died (e.g. a SIGSEGV in the
+    /// FFM/`SQLite` path). Distinct from [`Self::Protocol`] (a structurally malformed reply): a death
+    /// is a hard JVM fatal to report as a crash + restart, not a benign protocol desync.
+    #[error("worker process died before replying")]
+    Disconnected,
     /// The worker did not reply within the deadline; the caller should restart the epoch.
     #[error("worker timed out")]
     Timeout,
@@ -430,8 +435,9 @@ pub trait WorkerTransport {
     ///
     /// # Errors
     ///
-    /// Returns [`WorkerError::Timeout`] on deadline expiry, [`WorkerError::Io`] on transport I/O
-    /// failure, or [`WorkerError::Protocol`] on a malformed exchange.
+    /// Returns [`WorkerError::Timeout`] on deadline expiry, [`WorkerError::Disconnected`] if the worker
+    /// process died before replying (stdout closed / stdin write failed), [`WorkerError::Io`] on a
+    /// transport read error, or [`WorkerError::Protocol`] on a structurally malformed reply.
     fn request(&mut self, request: &Request, deadline: Duration) -> Result<Vec<u8>, WorkerError>;
 
     /// Kill the underlying worker (used before spawning a fresh epoch).
@@ -481,7 +487,14 @@ impl<T: WorkerTransport + std::fmt::Debug> JvmWorker<T> {
                 outcome
             }
             Err(WorkerError::Timeout) => decide(WorkerStatus::TimeoutRun),
-            Err(_) => decide(WorkerStatus::ProtocolError),
+            // The worker process died before/while replying (stdout EOF, broken pipe, or an IO read
+            // error) — e.g. a SIGSEGV in the FFM/`SQLite` path. That is a hard JVM fatal: report it as
+            // a crash + restart, not a protocol desync, so exactly these failures surface as findings.
+            Err(WorkerError::Io(_) | WorkerError::Disconnected) => {
+                decide(WorkerStatus::FatalJvmError)
+            }
+            // A structurally malformed/truncated reply (decode failure) is a genuine protocol desync.
+            Err(WorkerError::Protocol) => decide(WorkerStatus::ProtocolError),
         }
     }
 
@@ -632,7 +645,9 @@ impl WorkerTransport for SubprocessTransport {
             .as_ref()
             .ok_or(WorkerError::Protocol)?
             .send(request.encode())
-            .map_err(|_| WorkerError::Protocol)?;
+            // The writer thread ended: it owns the child's stdin, so this means the worker process is
+            // gone — a death, not a protocol desync.
+            .map_err(|_| WorkerError::Disconnected)?;
         if matches!(request, Request::Quit) {
             return Ok(Vec::new());
         }
@@ -640,7 +655,9 @@ impl WorkerTransport for SubprocessTransport {
             Ok(Ok(reply)) => Ok(reply),
             Ok(Err(err)) => Err(WorkerError::Io(err)),
             Err(RecvTimeoutError::Timeout) => Err(WorkerError::Timeout),
-            Err(RecvTimeoutError::Disconnected) => Err(WorkerError::Protocol),
+            // The reader thread ended (the child closed stdout / exited) before a reply arrived — the
+            // worker JVM died. Report it as such so `run()` classifies a crash, not a protocol desync.
+            Err(RecvTimeoutError::Disconnected) => Err(WorkerError::Disconnected),
         }
     }
 
@@ -951,6 +968,39 @@ mod tests {
         assert_eq!(outcome.exit_kind, ExitKind::Timeout);
         assert!(outcome.restart_required);
         assert!(!outcome.coverage_attributable);
+    }
+
+    #[test]
+    fn run_worker_death_is_a_crash_finding_not_a_protocol_desync() {
+        // A worker JVM that dies before replying (stdout EOF / broken stdin, e.g. a SIGSEGV in the
+        // FFM/SQLite path) surfaces as Disconnected or a transport Io error; either must be classified
+        // as a hard JVM fatal — a crash finding + restart — not a benign protocol desync.
+        for err in [
+            WorkerError::Disconnected,
+            WorkerError::Io(io::Error::from(io::ErrorKind::BrokenPipe)),
+        ] {
+            let mut worker = JvmWorker::new(
+                MockTransport::new(vec![Err(err)]),
+                "/nonexistent/map",
+                Duration::from_millis(1),
+            );
+            let outcome = worker.run(b"input");
+            assert_eq!(outcome.exit_kind, ExitKind::Crash);
+            assert_eq!(outcome.outcome_class, OutcomeClass::JvmFatal);
+            assert!(outcome.restart_required);
+            assert!(!outcome.coverage_attributable);
+        }
+
+        // A structurally malformed reply stays a protocol desync (non-attributable, restart), distinct
+        // from a process death.
+        let mut worker = JvmWorker::new(
+            MockTransport::new(vec![Err(WorkerError::Protocol)]),
+            "/nonexistent/map",
+            Duration::from_millis(1),
+        );
+        let outcome = worker.run(b"input");
+        assert_eq!(outcome.outcome_class, OutcomeClass::ProtocolDesync);
+        assert!(outcome.restart_required);
     }
 
     #[test]

@@ -160,6 +160,10 @@ fn jvm_mode_fuzz_smoke_reaches_loop_without_deadlock() {
             "cov.Worker",
         ])
         .env("RUST_LOG", "info")
+        // This smoke exercises the trivial FIXTURE worker (its classpath has no language-server jar),
+        // so override run_jvm_mode's default `ls` iteration body — otherwise the worker would try to
+        // embed `ls.core.ScalaLs` and fail to load it.
+        .env("COV_ITERATION_BODY", "fixture")
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()

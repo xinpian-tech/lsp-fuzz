@@ -245,8 +245,8 @@ mod tests {
     fn scala_language_metadata() {
         assert_eq!(Language::Scala.lsp_language_id(), "scala");
         let exts = Language::Scala.file_extensions();
-        assert!(exts.contains("scala"));
-        assert!(exts.contains("sc"));
+        assert!(exts.contains(&"scala"));
+        assert!(exts.contains(&"sc"));
     }
 
     /// Scala's highlight query must compile against the Scala grammar, and

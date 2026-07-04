@@ -367,16 +367,25 @@ impl FuzzCommand {
         let quiescence_deadline_ms = profile.quiescence_deadline_ms();
         let worker_reply_deadline = profile.worker_reply_deadline();
 
+        // The worker embeds the real in-process Scala language server when `COV_ITERATION_BODY=ls`;
+        // without it `cov.Worker` defaults to the planted fixture body, so a Scala fuzzing run must
+        // select `ls`. Default to it here (this spawn path owns the worker env), but respect an
+        // explicit operator override in the environment (e.g. the JVM smoke drives the fixture worker).
+        let iteration_body =
+            std::env::var("COV_ITERATION_BODY").unwrap_or_else(|_| "ls".to_string());
+
         // The worker publishes its coverage map at $COV_MAP_PATH; the executor copies from there.
         let spawn_worker = {
             let program = program.clone();
             let args = args.clone();
             let map_path = map_path.clone();
             let findings_path = findings_path.clone();
+            let iteration_body = iteration_body.clone();
             move || {
                 let mut command = std::process::Command::new(&program);
                 command
                     .args(&args)
+                    .env("COV_ITERATION_BODY", &iteration_body)
                     .env("COV_MAP_PATH", &map_path)
                     .env("COV_FINDINGS_PATH", &findings_path)
                     .env("COV_RUN_TIMEOUT_MS", run_timeout_ms.to_string())
