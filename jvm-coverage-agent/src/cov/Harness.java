@@ -69,6 +69,7 @@ public final class Harness {
         h.lifecycleLateWriteNoBleedGate();
         h.lifecyclePostResetStaleGate();
         h.lifecyclePostResetStaleExecutorGate();
+        h.perThreadPrevResetGate();
         h.lifecycleRunBudgetTimeoutGate();
         h.coldReplayGate();
         System.exit(h.failures == 0 ? 0 : 1);
@@ -459,6 +460,59 @@ public final class Harness {
             }
         } finally {
             w.close();
+        }
+    }
+
+    /**
+     * A worker thread reused across inputs must start each generation's first edge from 0, not the
+     * previous input's last block. Runs the SAME measured input (a fixed hit sequence) on ONE reused
+     * single-thread executor after two DIFFERENT predecessor inputs; with the per-generation prev
+     * reset the two resulting maps are identical, and without it the differing predecessor's last
+     * block XORs into the measured input's first edge and the maps differ — the failing-before /
+     * passing-after proof for the per-thread `prev` reset. Operates on {@link Cov} directly (like the
+     * saturation/late-write gates); `cov.*` is not instrumented, so the executor submit is not
+     * generation-captured and the hits run under the active generation.
+     */
+    private void perThreadPrevResetGate() throws Exception {
+        ExecutorService worker = Executors.newSingleThreadExecutor();
+        try {
+            // Predecessor A, then the measured input B, on the reused worker thread.
+            Cov.reset(101);
+            worker.submit(() -> {
+                Cov.hit(0x111);
+                Cov.hit(0x222);
+            }).get();
+            Cov.reset(102);
+            worker.submit(() -> {
+                Cov.hit(0x333);
+                Cov.hit(0x444);
+            }).get();
+            long afterA = Cov.digest();
+
+            // A DIFFERENT predecessor C (different last block), then the SAME measured input B, on the
+            // SAME reused thread.
+            Cov.reset(103);
+            worker.submit(() -> {
+                Cov.hit(0x555);
+                Cov.hit(0x666);
+            }).get();
+            Cov.reset(104);
+            worker.submit(() -> {
+                Cov.hit(0x333);
+                Cov.hit(0x444);
+            }).get();
+            long afterC = Cov.digest();
+
+            if (afterA == afterC) {
+                ok("per-thread prev reset per generation: identical input on a reused thread is "
+                        + "predecessor-independent");
+            } else {
+                fail("per-thread prev NOT reset per generation: identical input on a reused thread "
+                        + "produced different maps after different predecessors (" + afterA + " vs "
+                        + afterC + ")");
+            }
+        } finally {
+            worker.shutdownNow();
         }
     }
 

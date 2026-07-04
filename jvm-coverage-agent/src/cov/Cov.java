@@ -24,9 +24,18 @@ public final class Cov {
     // Previous-edge state is PER THREAD (AFL's `prev_location` is per execution thread): the real LS
     // runs instrumented code on many async compiler/server threads, and a process-global `prev` would
     // make each edge depend on whichever thread happened to run the last probe, so identical inputs
-    // could yield different edge indices under normal scheduling. A 1-element int[] holder avoids
-    // boxing on the hot path.
-    private static final ThreadLocal<int[]> PREV = ThreadLocal.withInitial(() -> new int[1]);
+    // could yield different edge indices under normal scheduling. The state is TAGGED with the
+    // generation it belongs to: a thread reused across inputs must start each generation's first edge
+    // from 0, not the previous input's last block — otherwise the same input run after a different
+    // predecessor produces a different first edge (breaking identical-input stability). `reset()` only
+    // runs on the driver thread, so the clear is done lazily on the first hit of a new generation on
+    // ANY thread. The holder avoids boxing on the hot path.
+    private static final class PrevState {
+        int prev;
+        long generation = Long.MIN_VALUE; // no generation observed yet
+    }
+
+    private static final ThreadLocal<PrevState> PREV = ThreadLocal.withInitial(PrevState::new);
 
     // classId -> class name (registered at instrumentation time) and the set of class ids that
     // have executed at least one probe. Concurrent because background compiler threads hit them.
@@ -138,13 +147,19 @@ public final class Cov {
         if (staleGenerationWrite()) {
             return; // stale background write from a finished generation: never touch the live map
         }
-        int[] prevHolder = PREV.get();
-        int edge = (prevHolder[0] ^ id) & (MAP_SIZE - 1);
+        PrevState st = PREV.get();
+        if (st.generation != activeGeneration) {
+            // First edge of this generation on this thread: AFL's prev_location starts fresh per
+            // input, so a reused LS/executor thread must not XOR with the previous input's last block.
+            st.prev = 0;
+            st.generation = activeGeneration;
+        }
+        int edge = (st.prev ^ id) & (MAP_SIZE - 1);
         int value = MAP[edge] & 0xff;
         if (value != 0xff) {
             MAP[edge] = (byte) (value + 1);
         }
-        prevHolder[0] = id >>> 1;
+        st.prev = id >>> 1;
         TOTAL_WRITES.incrementAndGet();
         LAST_WRITE_NANOS.set(System.nanoTime());
         if (snapshotClosedGeneration == activeGeneration) {
@@ -176,10 +191,9 @@ public final class Cov {
      */
     public static void reset(long generation) {
         Arrays.fill(MAP, (byte) 0);
-        // Reset the calling (driver) thread's previous-edge state for the fresh input. Per-thread
-        // `prev` on the LS's own worker threads carries deterministically across identical inputs, so
-        // it is not a nondeterminism source; only the shared global was.
-        PREV.get()[0] = 0;
+        // Previous-edge state is cleared lazily per generation on each thread's first `hit` (see PREV),
+        // so `reset` — which only runs on the driver thread — need not (and must not rely on) clearing
+        // the LS's own worker threads here; installing the new generation is what triggers their clear.
         COVERED_CLASSES.clear();
         activeGeneration = generation;
         snapshotClosedGeneration = -1;

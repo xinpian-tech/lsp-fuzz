@@ -200,12 +200,17 @@ impl ScalaExecutionProfile {
     /// The determinism flags absent from a candidate JVM launch `argv`, in declared order. A
     /// launch surface for the Scala fuzzing config must carry all of them; a non-empty result means the
     /// launch is not running under the pinned determinism configuration and coverage may be unstable.
+    ///
+    /// Only the JVM-option portion of `argv` counts — the tokens BEFORE the main class (or `-jar` /
+    /// `-m`). A determinism flag placed after the main class (e.g. `java … cov.Worker -Xshare:off`) is
+    /// an application argument the JVM ignores, so it must NOT satisfy the gate.
     #[must_use]
     pub fn missing_determinism_flags(&self, argv: &[String]) -> Vec<&'static str> {
+        let boundary = jvm_option_region_len(argv);
         self.determinism_flags()
             .iter()
             .copied()
-            .filter(|flag| !argv.iter().any(|a| a == flag))
+            .filter(|flag| !argv[..boundary].iter().any(|a| a == flag))
             .collect()
     }
 
@@ -310,6 +315,50 @@ pub fn validate_backdrop_root(root: &Path) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+/// The length of the JVM-option region of a `java` launch `argv`: the count of leading tokens that
+/// the JVM parses as options, up to (but not including) the main class, or `-jar`/`-m`/`--module`
+/// (after which nothing is a JVM option). Tokens at indices `>= this` are the main class + application
+/// arguments, which the JVM does not treat as options. `argv[0]` (the `java` program) is included in
+/// the count but is never a flag, so it is harmless.
+fn jvm_option_region_len(argv: &[String]) -> usize {
+    // Options whose value is a SEPARATE following token (so that token is not the main class); the
+    // `--opt=value` forms are single tokens and need no special handling. `-jar`/`-m`/`--module`
+    // terminate option parsing entirely and are handled by the break below.
+    const SEPARATE_VALUE_OPTS: &[&str] = &[
+        "-cp",
+        "-classpath",
+        "--class-path",
+        "-p",
+        "--module-path",
+        "--upgrade-module-path",
+        "--add-modules",
+        "--add-reads",
+        "--add-exports",
+        "--add-opens",
+        "--patch-module",
+        "--limit-modules",
+        "--source",
+    ];
+    let mut i = 1.min(argv.len());
+    while i < argv.len() {
+        let a = argv[i].as_str();
+        // `-jar <jar>` / `-m|--module <module>` end option parsing: everything after is not an option.
+        if a == "-jar" || a == "-m" || a == "--module" {
+            break;
+        }
+        // The first bare (non-`-`) token is the main class; option parsing ends there.
+        if !a.starts_with('-') {
+            break;
+        }
+        i += if SEPARATE_VALUE_OPTS.contains(&a) {
+            2
+        } else {
+            1
+        };
+    }
+    i.min(argv.len())
 }
 
 /// Whether `dir` contains at least one `*.semanticdb` file (searched recursively).
@@ -486,6 +535,49 @@ mod tests {
                 "-Xshare:off",
                 "-XX:+UseSerialGC",
             ]
+        );
+
+        // Flags placed AFTER the main class are application arguments the JVM ignores, so they must
+        // NOT satisfy the gate — all three are still reported missing.
+        let after_main: Vec<String> = [
+            "java",
+            "-cp",
+            "ls.jar",
+            "cov.Worker",
+            "-XX:-UseCompactObjectHeaders",
+            "-Xshare:off",
+            "-XX:+UseSerialGC",
+        ]
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+        assert_eq!(
+            profile.missing_determinism_flags(&after_main),
+            vec![
+                "-XX:-UseCompactObjectHeaders",
+                "-Xshare:off",
+                "-XX:+UseSerialGC",
+            ]
+        );
+
+        // The `-cp` value (`ls.jar`) is a separate-token option value, not the main class, so flags
+        // after it but before `cov.Worker` are still in the JVM-option region and DO satisfy the gate.
+        let value_opt_then_flags: Vec<String> = [
+            "java",
+            "-cp",
+            "ls.jar",
+            "-XX:-UseCompactObjectHeaders",
+            "-Xshare:off",
+            "-XX:+UseSerialGC",
+            "cov.Worker",
+        ]
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+        assert!(
+            profile
+                .missing_determinism_flags(&value_opt_then_flags)
+                .is_empty()
         );
     }
 }
