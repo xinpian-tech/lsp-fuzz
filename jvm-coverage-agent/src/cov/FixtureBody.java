@@ -34,6 +34,12 @@ public final class FixtureBody implements IterationBody {
     private static final int MODE_EXPECTED_CANCELLATION = 0xED;
     // 0xEE and 0xFF are reserved by Target (crash / hang); use 0xEF for the planted hard JVM fatal.
     private static final int MODE_JVM_FATAL = 0xEF;
+    // Executor-boundary variant of the post-reset stale write: the writer is submitted to an executor
+    // via an INSTRUMENTED fixture method (so the agent's submit-call-site rewrite is the only thing
+    // that captures its generation), NOT wrapped in Lifecycle.runInGeneration. Proves the fail-closed
+    // scoping of detached executor work the real language server relies on.
+    private static final int MODE_POST_RESET_STALE_EXECUTOR = 0xF0;
+    private static final int MODE_RELEASE_STALE_EXECUTOR = 0xF1;
 
     private static final long BACKGROUND_DELAY_MS = 30;
     private static final long NEVER_COMPLETES_MS = 60_000;
@@ -49,6 +55,16 @@ public final class FixtureBody implements IterationBody {
     // post-reset stale write is suppressed rather than attributed to the current input.
     private Thread pendingStale;
     private CountDownLatch staleGate;
+    // Executor-submitted parked writer (0xF0/0xF1): the executor persists across inputs so the task
+    // scheduled under input N is still parked when input N+1 releases it under a fresh generation.
+    private static final java.util.concurrent.ExecutorService STALE_EXECUTOR =
+            java.util.concurrent.Executors.newSingleThreadExecutor(r -> {
+                Thread t = new Thread(r, "fixture-stale-executor");
+                t.setDaemon(true);
+                return t;
+            });
+    private java.util.concurrent.Future<?> executorStaleTask;
+    private CountDownLatch executorStaleGate;
     // Fine-grained evidence a clean-snapshot mode reports to the worker (defaults to normal success).
     private int evidenceTag = Evidence.NORMAL_SUCCESS;
     private String evidenceMessage = "";
@@ -120,6 +136,30 @@ public final class FixtureBody implements IterationBody {
                     joinQuiet(pendingStale);
                     pendingStale = null;
                     staleGate = null;
+                }
+            }
+            case MODE_POST_RESET_STALE_EXECUTOR -> {
+                // Submit a parked writer through an INSTRUMENTED fixture method: the agent rewrites its
+                // executor `submit` to capture THIS generation. The task only writes once released by a
+                // later input (0xF1), by which time the map has been reset for a fresh generation.
+                executorStaleGate = new CountDownLatch(1);
+                executorStaleTask =
+                        fixture.ExecutorLateWrite.schedule(STALE_EXECUTOR, executorStaleGate);
+            }
+            case MODE_RELEASE_STALE_EXECUTOR -> {
+                // Release the executor-submitted writer under the fresh generation; its captured
+                // generation (from the rewritten submit) no longer matches active, so the write is
+                // suppressed rather than attributed to this input.
+                if (executorStaleGate != null) {
+                    executorStaleGate.countDown();
+                    try {
+                        executorStaleTask.get(COORDINATION_TIMEOUT_MS, TimeUnit.MILLISECONDS);
+                    } catch (Exception e) {
+                        // A timeout/interruption here does not matter to the gate: the assertion is on
+                        // whether the released write landed in this generation's map.
+                    }
+                    executorStaleTask = null;
+                    executorStaleGate = null;
                 }
             }
             case MODE_RUN_BUDGET_TIMEOUT ->

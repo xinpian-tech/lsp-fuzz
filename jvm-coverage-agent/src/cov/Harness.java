@@ -67,6 +67,7 @@ public final class Harness {
         h.lifecycleSnapshotRaceGate();
         h.lifecycleLateWriteNoBleedGate();
         h.lifecyclePostResetStaleGate();
+        h.lifecyclePostResetStaleExecutorGate();
         h.lifecycleRunBudgetTimeoutGate();
         h.coldReplayGate();
         System.exit(h.failures == 0 ? 0 : 1);
@@ -391,6 +392,36 @@ public final class Harness {
                 ok("post-reset stale write suppressed: released under a new generation, not attributed");
             } else {
                 fail("post-reset stale-write gate failed: " + describe(stale) + " / "
+                        + describe(release));
+            }
+        } finally {
+            w.close();
+        }
+    }
+
+    /**
+     * The executor-boundary variant of the post-reset stale-write gate: input N submits the parked
+     * writer through an INSTRUMENTED fixture method (a plain {@code ExecutorService.submit}, NOT
+     * wrapped in {@code Lifecycle.runInGeneration}), so the ONLY thing that captures its generation is
+     * the agent's rewrite of the {@code submit} call site. Input N+1 releases it under a fresh
+     * generation; a correct rewrite suppresses the write (N+1's map stays empty). With the rewrite
+     * disabled the write leaks into N+1's map, so this gate fails — it is the failing-before /
+     * passing-after proof for detached real-executor scoping. Requires the agent (the rewrite only
+     * happens under instrumentation).
+     */
+    private void lifecyclePostResetStaleExecutorGate() throws Exception {
+        WorkerHandle w = new WorkerHandle(FAST_WINDOWS);
+        try {
+            Run stale = w.run(new byte[] {(byte) 0xF0}, 5000); // submits a writer capturing gen N
+            Run release = w.run(new byte[] {(byte) 0xF1}, 5000); // releases it under gen N+1
+            if (stale != null && stale.status == 0
+                    && release != null && release.status == 0
+                    && countNonZero(release.map) == 0) {
+                ok("post-reset stale write via executor.submit suppressed: agent-captured generation, "
+                        + "not attributed to the later input");
+            } else {
+                fail("post-reset executor stale-write gate failed (a detached executor task's write "
+                        + "leaked into the later input): " + describe(stale) + " / "
                         + describe(release));
             }
         } finally {

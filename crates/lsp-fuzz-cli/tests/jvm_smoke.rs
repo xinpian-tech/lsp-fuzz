@@ -83,6 +83,7 @@ fn jvm_mode_fuzz_smoke_reaches_loop_without_deadlock() {
         format!("{agent}/cov/Worker.java"),
         format!("{agent}/fixture/Target.java"),
         format!("{agent}/fixture/LateWriteFixture.java"),
+        format!("{agent}/fixture/ExecutorLateWrite.java"),
     ];
     // Prove the checked-in sources exist BEFORE deciding whether the external toolchain is missing,
     // so a source-list regression fails even in a no-JDK shell. Only then may a missing javac skip.

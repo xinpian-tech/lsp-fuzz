@@ -131,6 +131,36 @@ public final class CoverageAgent {
                     super.visitLabel(label);
                     emitHit(); // block leader (branch/jump target, loop head, handler entry)
                 }
+
+                // Generation-capture at the executor SUBMISSION boundary: before an instrumented class
+                // hands a task to an executor, wrap the task so it captures the current generation and
+                // runs under it. A detached task that fires after a later reset is then suppressed
+                // (captured generation != active) rather than misattributed to the next input. The wrap
+                // is a stack-neutral Runnable->Runnable / Callable->Callable INVOKESTATIC on the task
+                // argument (top of stack). Only instrumented classes are rewritten, so the
+                // uninstrumented lsp4j read-loop's own executor use is untouched (its long-lived thread
+                // must not be pinned); capturing per submitted task never pins the pool thread anyway.
+                @Override
+                public void visitMethodInsn(
+                        int op, String owner, String mName, String desc, boolean itf) {
+                    if ("execute".equals(mName) && "(Ljava/lang/Runnable;)V".equals(desc)) {
+                        wrapTask("capturingRunnable", "Ljava/lang/Runnable;");
+                    } else if ("submit".equals(mName)
+                            && "(Ljava/lang/Runnable;)Ljava/util/concurrent/Future;".equals(desc)) {
+                        wrapTask("capturingRunnable", "Ljava/lang/Runnable;");
+                    } else if ("submit".equals(mName)
+                            && "(Ljava/util/concurrent/Callable;)Ljava/util/concurrent/Future;"
+                                    .equals(desc)) {
+                        wrapTask("capturingCallable", "Ljava/util/concurrent/Callable;");
+                    }
+                    super.visitMethodInsn(op, owner, mName, desc, itf);
+                }
+
+                private void wrapTask(String helper, String type) {
+                    super.visitMethodInsn(
+                            Opcodes.INVOKESTATIC, "cov/Cov", helper,
+                            "(" + type + ")" + type, false);
+                }
             };
         }
     }

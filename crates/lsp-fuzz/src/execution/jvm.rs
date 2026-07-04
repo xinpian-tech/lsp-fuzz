@@ -1655,6 +1655,7 @@ mod tests {
 
         let map_file = out.path().join("idx-map.bin");
         let classes_file = out.path().join("idx-classes.txt");
+        let findings_file = out.path().join("idx-findings.txt");
         let classpath = format!("{}:{}", out.path().display(), ls_jar.display());
         let agent_jar = std::env::var_os("COV_AGENT_JAR").map(std::path::PathBuf::from);
         let agent_attached = agent_jar.as_ref().is_some_and(|j| j.exists());
@@ -1669,6 +1670,7 @@ mod tests {
         command
             .env("COV_ITERATION_BODY", "ls")
             .env("COV_MAP_PATH", &map_file)
+            .env("COV_FINDINGS_PATH", &findings_file)
             .env("COV_SETTLE_MS", "50")
             .env("COV_LATE_WATCH_MS", "50")
             .env("COV_QUIESCE_DEADLINE_MS", "20000");
@@ -1699,29 +1701,59 @@ mod tests {
             "input N must resolve to a definite lifecycle outcome, not hang: {outcome_n:?}"
         );
 
-        // Input N+1: a clean, different single-file references input. It must be an attributable,
-        // uncontaminated snapshot (the guards confirm no straggler/late/cross-generation write from N),
-        // OR the guard must have tripped to a non-attributable restart — never silently contaminated.
+        // The references request must have actually driven the server and produced its finding, tying
+        // the outcome to the request under test: input N's outcome is a JSON-RPC error, and the
+        // findings side channel records a `textDocument/references` error (the current LS answers a
+        // references request over a non-SemanticDB overlay with `-32803`). This proves the index
+        // request path executed, not just initialization.
+        assert_eq!(
+            outcome_n.outcome_class,
+            crate::execution::outcome::OutcomeClass::JsonRpcError,
+            "input N (references over the overlay) must produce a JSON-RPC error finding: {outcome_n:?}"
+        );
+        let findings = std::fs::read_to_string(&findings_file).unwrap_or_default();
+        assert!(
+            findings
+                .lines()
+                .any(|l| l.starts_with("textDocument/references\t")),
+            "the references finding must be recorded and tied to the request; findings:\n{findings}"
+        );
+
+        // Input N+1: a clean, different single-file references input. This live gate specifically
+        // expects the detached index/BSP work from N to QUIESCE within N's window, so N+1 is an
+        // attributable, uncontaminated snapshot (no restart). The fail-closed path — where a detached
+        // executor write that DOES land post-reset is suppressed rather than attributed, or trips a
+        // non-attributable restart — is proven deterministically by the agent Harness
+        // `lifecyclePostResetStaleExecutorGate`; here we assert the steady-state clean outcome.
         let input_n1 = index_references_input("other.scala", "object O:\n  val oo = 2\n");
         let outcome_n1 =
             worker.run_capturing(&converter.to_target_bytes(&input_n1).to_vec(), &mut buf);
         assert!(
-            outcome_n1.coverage_attributable != outcome_n1.restart_required,
-            "N+1 must be either a clean attributable snapshot or a tripped-guard restart, never both \
-             nor a silently attributed contaminated run: {outcome_n1:?}"
-        );
-        assert!(
             outcome_n1.coverage_attributable && !outcome_n1.restart_required,
-            "the detached index/BSP work from N must quiesce so N+1 is attributable + uncontaminated \
-             (if this ever regresses to a restart, the detached-executor scoping is not holding): \
+            "N+1 must be attributable + uncontaminated (N's detached index/BSP work quiesced within \
+             N's window); a regression to a restart means detached-executor scoping is not holding: \
              {outcome_n1:?}"
         );
 
         if agent_attached {
             let classes = std::fs::read_to_string(&classes_file).unwrap_or_default();
+            // The references request must reach a real INDEX namespace, not just transport/facade —
+            // the same signal the live index gate requires (the LS's own SemanticDB reader + server
+            // index namespaces).
+            const INDEX_NAMESPACES: &[&str] = &[
+                "ls.semanticdb",
+                "ls.index",
+                "ls.postings",
+                "ls.sqlite",
+                "ls.rename",
+                "ls.bsp",
+            ];
             assert!(
-                classes.lines().any(|c| c.starts_with("ls.")),
-                "index requests should reach real ls.* classes; covered:\n{classes}"
+                classes
+                    .lines()
+                    .any(|c| INDEX_NAMESPACES.iter().any(|ns| c.starts_with(ns))),
+                "index references should reach a real index namespace {INDEX_NAMESPACES:?}; \
+                 covered:\n{classes}"
             );
         }
     }
@@ -1831,6 +1863,7 @@ mod tests {
             "cov/Worker.java",
             "fixture/Target.java",
             "fixture/LateWriteFixture.java",
+            "fixture/ExecutorLateWrite.java",
         ]
         .iter()
         .map(|rel| format!("{agent}/{rel}"))

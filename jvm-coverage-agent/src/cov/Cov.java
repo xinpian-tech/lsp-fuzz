@@ -58,6 +58,58 @@ public final class Cov {
     }
 
     /**
+     * Wrap a task submitted to an executor so it captures the CURRENT generation at submission time and
+     * runs under it, restoring any prior captured generation afterwards. The agent rewrites
+     * {@code Executor.execute}/{@code ExecutorService.submit} call sites in instrumented server code to
+     * route the task through here, so a detached task that wakes after a later {@link #reset(long)} has
+     * a captured generation that no longer matches the active one — its writes are then suppressed
+     * ({@link #staleGenerationWrite()}) instead of being attributed to the next input. Capturing per
+     * task (not per thread) is what lets a pooled thread keep serving later generations correctly: the
+     * prior thread-local is restored, so the shared read-loop/pool thread is never pinned.
+     */
+    public static Runnable capturingRunnable(Runnable task) {
+        if (task == null) {
+            return null;
+        }
+        final long captured = activeGeneration;
+        return () -> {
+            Long prev = TASK_GENERATION.get();
+            TASK_GENERATION.set(captured);
+            try {
+                task.run();
+            } finally {
+                if (prev == null) {
+                    TASK_GENERATION.remove();
+                } else {
+                    TASK_GENERATION.set(prev);
+                }
+            }
+        };
+    }
+
+    /** {@link #capturingRunnable(Runnable)} for a {@link java.util.concurrent.Callable} submission. */
+    public static <T> java.util.concurrent.Callable<T> capturingCallable(
+            java.util.concurrent.Callable<T> task) {
+        if (task == null) {
+            return null;
+        }
+        final long captured = activeGeneration;
+        return () -> {
+            Long prev = TASK_GENERATION.get();
+            TASK_GENERATION.set(captured);
+            try {
+                return task.call();
+            } finally {
+                if (prev == null) {
+                    TASK_GENERATION.remove();
+                } else {
+                    TASK_GENERATION.set(prev);
+                }
+            }
+        };
+    }
+
+    /**
      * A write from a background task whose captured generation no longer matches the active one is
      * stale: it belongs to a finished iteration and must not touch the current map. Suppress it and
      * flag its own generation late (so the epoch is tainted before the next accepted snapshot).
