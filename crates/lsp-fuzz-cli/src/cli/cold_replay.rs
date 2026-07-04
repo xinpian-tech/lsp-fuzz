@@ -82,6 +82,28 @@ fn scala_launch_args(profile: &ScalaExecutionProfile, ls_jar: &std::path::Path) 
     args
 }
 
+/// The first required piece of replay environment that is missing, or `None` if all present.
+/// `--backdrop-root` covers `BACKDROP_OUT`; every other var in the profile's `required_env` must be
+/// present in the process environment (the spawned server inherits it), checked via `env_present`.
+fn missing_replay_env(
+    profile: &ScalaExecutionProfile,
+    backdrop_supplied: bool,
+    env_present: impl Fn(&str) -> bool,
+) -> Option<String> {
+    if profile.mode() == lsp_fuzz::execution::scala_profile::ScalaProfileMode::Index
+        && !backdrop_supplied
+    {
+        return Some("--backdrop-root (or BACKDROP_OUT)".to_string());
+    }
+    profile
+        .required_env()
+        .iter()
+        .find(|var| **var != "BACKDROP_OUT" && !env_present(var))
+        .map(|var| {
+            format!("the {var} environment variable (the server's pinned native configuration)")
+        })
+}
+
 impl ColdReplayCommand {
     pub fn run(self, _global_options: GlobalOptions) -> anyhow::Result<()> {
         let mut bundle = load_validated_bundle(&self.bundle)?;
@@ -93,12 +115,18 @@ impl ColdReplayCommand {
             "index" => ScalaExecutionProfile::index(),
             other => bail!("finding bundle has an unknown Scala profile mode: {other:?}"),
         };
-        if profile.mode() == lsp_fuzz::execution::scala_profile::ScalaProfileMode::Index
-            && self.backdrop_root.is_none()
-        {
+        // The spawned server inherits this process's environment, so the profile's required env
+        // (BACKDROP_OUT — satisfied by --backdrop-root — and, in index mode, LS_SQLITE_LIB) must be
+        // present up front. Without the pinned native SQLite the replay would run under a different
+        // native config than the fuzzing run and could fail (or diverge) on the FFM/SQLite path rather
+        // than reproduce the finding.
+        if let Some(missing) = missing_replay_env(&profile, self.backdrop_root.is_some(), |v| {
+            std::env::var_os(v).is_some()
+        }) {
             bail!(
-                "replaying an index-mode finding requires --backdrop-root (or BACKDROP_OUT); the \
-                 server needs the verified frozen backdrop"
+                "replaying a {}-mode finding requires {missing}; set it before cold replay so the \
+                 replay matches the fuzzing run's native/backdrop surface",
+                profile.mode().as_str()
             );
         }
 
@@ -163,7 +191,31 @@ mod tests {
 
     use lsp_fuzz::execution::scala_profile::ScalaExecutionProfile;
 
-    use super::{ColdReplayCommand, load_validated_bundle, scala_launch_args};
+    use super::{ColdReplayCommand, load_validated_bundle, missing_replay_env, scala_launch_args};
+
+    /// Index-mode cold replay requires the backdrop AND the pinned native `SQLite` env; PC mode
+    /// requires neither. The check is env-injected so it does not depend on the test process's env.
+    #[test]
+    fn missing_replay_env_requires_index_backdrop_and_sqlite() {
+        let index = ScalaExecutionProfile::index();
+        // No backdrop → the backdrop is reported first.
+        assert!(
+            missing_replay_env(&index, false, |_| true)
+                .unwrap()
+                .contains("backdrop")
+        );
+        // Backdrop present but LS_SQLITE_LIB absent → it is reported.
+        assert!(
+            missing_replay_env(&index, true, |_| false)
+                .unwrap()
+                .contains("LS_SQLITE_LIB")
+        );
+        // Backdrop present and all env present → nothing missing.
+        assert!(missing_replay_env(&index, true, |_| true).is_none());
+        // PC mode needs neither a backdrop nor extra env.
+        let pc = ScalaExecutionProfile::presentation_compiler();
+        assert!(missing_replay_env(&pc, false, |_| false).is_none());
+    }
 
     /// Cold replay must launch under the determinism flags (before `-cp`/main class) for both
     /// Scala modes, so the replay reproduces the fuzzing config's coverage/behavior surface.

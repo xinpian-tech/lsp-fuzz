@@ -32,6 +32,72 @@ fn assert_sources_present(sources: &[String]) {
     );
 }
 
+/// Write the minimal marker layout `validate_backdrop_root` requires, so a test can point
+/// `BACKDROP_OUT` at a valid frozen backdrop without a real zaozi checkout.
+fn write_fake_backdrop(root: &Path) {
+    std::fs::write(root.join("backdrop-metadata.json"), b"{}").unwrap();
+    std::fs::create_dir_all(root.join("bsp")).unwrap();
+    std::fs::write(root.join("bsp").join("mill-bsp.json"), b"{}").unwrap();
+    std::fs::create_dir_all(root.join("semanticdb").join("pkg")).unwrap();
+    std::fs::write(
+        root.join("semanticdb")
+            .join("pkg")
+            .join("X.scala.semanticdb"),
+        b"sdb",
+    )
+    .unwrap();
+}
+
+/// In JVM index mode, the required env supplied via `--target-env` (not the ambient process env) must
+/// satisfy the profile validation — proving `--target-env` is honored on the JVM path like native
+/// mode. The run then fails later (spawning the bogus worker program), NOT with a missing-required-
+/// environment error. Needs no JDK: it never reaches a real worker.
+#[test]
+fn jvm_index_mode_honors_target_env_for_required_vars() {
+    let backdrop = tempfile::tempdir().expect("tempdir");
+    write_fake_backdrop(backdrop.path());
+    let state = tempfile::tempdir().expect("tempdir");
+    let output = Command::new(env!("CARGO_BIN_EXE_lsp-fuzz-cli"))
+        .args([
+            "fuzz",
+            "--state",
+            state.path().to_str().unwrap(),
+            "--time-budget",
+            "0",
+            "--scala-mode",
+            "index",
+            // Both index-required vars supplied ONLY via --target-env (not the ambient env).
+            "--target-env",
+            &format!(
+                "LS_SQLITE_LIB=/nonexistent/libsqlite3.so,BACKDROP_OUT={}",
+                backdrop.path().display()
+            ),
+            // Determinism flags before the main class; the program does not exist so the run fails at
+            // spawn — AFTER passing environment + determinism validation.
+            "--jvm-worker",
+            "/nonexistent/java",
+            "-XX:-UseCompactObjectHeaders",
+            "-Xshare:off",
+            "-XX:+UseSerialGC",
+            "-cp",
+            "/nonexistent/ls.jar",
+            "cov.Worker",
+        ])
+        .output()
+        .expect("run CLI");
+    assert!(
+        !output.status.success(),
+        "the bogus worker program must make the run fail"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.contains("missing required environment")
+            && !stderr.contains("LS_SQLITE_LIB environment variable")
+            && !stderr.contains("BACKDROP_OUT environment variable"),
+        "required env supplied via --target-env must satisfy validation; got:\n{stderr}"
+    );
+}
+
 /// A JVM-mode `fuzz` launch whose `--jvm-worker` argv omits the determinism flags is rejected
 /// before any worker is spawned (so this needs no JDK): the Scala fuzzing config must run the server
 /// deterministically. Complements the happy-path smoke below, which DOES pass the flags.

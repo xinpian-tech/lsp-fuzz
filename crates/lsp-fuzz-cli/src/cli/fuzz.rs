@@ -349,6 +349,19 @@ impl FuzzCommand {
         let program = program.clone();
         let args = args.to_vec();
 
+        // Honor `--target-env` for the JVM path the same way native mode does. These vars (e.g. index
+        // mode's `LS_SQLITE_LIB` / `BACKDROP_OUT`) are read from the PROCESS environment by the profile
+        // validation below, the backdrop converter (`JvmLspInputConverter` reads `BACKDROP_OUT`), and
+        // the worker (which inherits it), so apply them to the process env up front — before any of
+        // those reads and before any worker/thread is spawned.
+        for (key, value) in &self.execution.target_env {
+            // SAFETY: run at CLI startup on the main thread, before the fuzz loop spawns any worker
+            // or thread, so there is no concurrent environment access.
+            unsafe {
+                std::env::set_var(key, value);
+            }
+        }
+
         // The Scala execution profile isolates the language-server mode (init params, capabilities,
         // per-mode method allowlist). Index mode needs its native SQLite + verified backdrop.
         let profile =
@@ -395,6 +408,7 @@ impl FuzzCommand {
             std::env::var("COV_ITERATION_BODY").unwrap_or_else(|_| "ls".to_string());
 
         // The worker publishes its coverage map at $COV_MAP_PATH; the executor copies from there.
+        let target_env = self.execution.target_env.clone();
         let spawn_worker = {
             let program = program.clone();
             let args = args.clone();
@@ -405,6 +419,9 @@ impl FuzzCommand {
                 let mut command = std::process::Command::new(&program);
                 command
                     .args(&args)
+                    // The operator's `--target-env` (e.g. LS_SQLITE_LIB / BACKDROP_OUT), applied
+                    // explicitly on the worker command as well as the process env above.
+                    .envs(&target_env)
                     .env("COV_ITERATION_BODY", &iteration_body)
                     .env("COV_MAP_PATH", &map_path)
                     .env("COV_FINDINGS_PATH", &findings_path)
