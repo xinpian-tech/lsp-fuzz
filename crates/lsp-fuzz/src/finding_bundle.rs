@@ -485,14 +485,25 @@ pub fn cold_replay(
         let _ = stdout.read_to_end(&mut buf);
         let _ = tx.send(buf);
     });
-    // Stderr is bounded (truncated) so a chatty process cannot exhaust memory.
+    // Stderr is genuinely bounded: retain at most STDERR_CAPTURE_CAP bytes but keep reading (and
+    // discarding) to EOF, so a chatty process can neither exhaust the driver's memory nor block on a
+    // full stderr pipe. Classification runs on the retained prefix.
     let err_reader = std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        let _ = stderr.read_to_end(&mut buf);
-        if buf.len() > STDERR_CAPTURE_CAP {
-            buf.truncate(STDERR_CAPTURE_CAP);
+        let mut retained = Vec::new();
+        let mut chunk = [0u8; 8192];
+        loop {
+            match stderr.read(&mut chunk) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    if retained.len() < STDERR_CAPTURE_CAP {
+                        let room = STDERR_CAPTURE_CAP - retained.len();
+                        retained.extend_from_slice(&chunk[..n.min(room)]);
+                    }
+                    // Bytes beyond the cap are drained and dropped so the child never blocks.
+                }
+            }
         }
-        String::from_utf8_lossy(&buf).into_owned()
+        String::from_utf8_lossy(&retained).into_owned()
     });
 
     // The server exits on `exit`, closing stdout and completing the read; if it hangs, the deadline
@@ -521,7 +532,9 @@ pub fn cold_replay(
 
     let received = parse_lsp_payloads(&received_bytes);
     let backdrop_root = config.backdrop_root.as_deref().and_then(Path::to_str);
-    let findings = replay_findings(input, &received, backdrop_root);
+    // Match against the SAME allowlist-filtered stored requests the stream actually sent.
+    let stored = cold_replay_stored_messages(input, config.profile);
+    let findings = replay_findings(&stored, &received, backdrop_root);
     let outcome_class = classify_replay(end, &stderr_text, &findings);
     Ok(ReplayObservation {
         outcome_class,
@@ -529,11 +542,26 @@ pub fn cold_replay(
     })
 }
 
-/// Build the framed JSON-RPC stream for a cold replay: the profile's `initialize` params (rooted at
-/// the materialized `root_uri`) + `initialized`, then the input's `didOpen`s and stored messages
-/// (localized to `localization_dir`) + `shutdown`/`exit`. The stored-request id numbering matches the
-/// native path (initialize consumes id 0; the first stored request is id 1), so the responses line up
-/// with [`RequestResponseMatching`].
+/// The generic LSP lifecycle methods the fuzzing worker owns per epoch and never replays from the
+/// input stream (cold replay likewise supplies its own).
+const LIFECYCLE_METHODS: &[&str] = &["initialize", "initialized", "shutdown", "exit"];
+
+/// Whether a message with this method is replayed to the shipped entrypoint under `profile`, mirroring
+/// [`cov::LsIterationBody`]'s dispatch rule: generic lifecycle is never replayed from the input, and a
+/// stored message outside the profile's method allowlist is dropped.
+fn is_replayed(method: &str, profile: &ScalaExecutionProfile) -> bool {
+    !LIFECYCLE_METHODS.contains(&method) && profile.allowed_methods().contains(&method)
+}
+
+/// Build the framed JSON-RPC stream for a cold replay so it drives the SAME message surface the JVM
+/// fuzzing path does: the profile's `initialize` params (rooted at the materialized `root_uri`) +
+/// `initialized`, then the input's `didOpen`s and stored messages that pass the profile method
+/// allowlist (localized to `localization_dir`), then a final `shutdown`/`exit` to terminate the
+/// entrypoint. Lifecycle from the input stream is never replayed, and a disallowed stored message is
+/// dropped exactly as the in-process worker drops it — so cold replay never sends a request the
+/// fuzzer would not have. The sent-request id numbering matches [`cold_replay_stored_messages`]
+/// (the profile initialize consumes id 0; the first sent stored request is id 1), so the responses
+/// line up with [`RequestResponseMatching`].
 fn build_cold_replay_stream(
     input: &LspInput,
     profile: &ScalaExecutionProfile,
@@ -553,13 +581,37 @@ fn build_cold_replay_stream(
     framed.extend(
         JsonRPCMessage::notification("initialized".into(), serde_json::json!({})).to_lsp_payload(),
     );
-    // The rest of the sequence (didOpens, stored messages, shutdown, exit); skip the generic
-    // initialize + initialized the sequence would otherwise start with.
-    for msg in input.message_sequence().skip(2) {
+    // Generated didOpens + stored messages, filtered by the profile allowlist like the worker.
+    for msg in input.message_sequence() {
+        if !is_replayed(msg.method(), profile) {
+            continue;
+        }
         let message = msg.into_json_rpc(&mut id, Some(&localize_uri));
         framed.extend(message.to_lsp_payload());
     }
+    // Terminate the shipped entrypoint gracefully.
+    framed.extend(
+        JsonRPCMessage::request(id, "shutdown".into(), serde_json::Value::Null).to_lsp_payload(),
+    );
+    framed.extend(
+        JsonRPCMessage::notification("exit".into(), serde_json::Value::Null).to_lsp_payload(),
+    );
     framed
+}
+
+/// The stored input messages that cold replay actually sends (dropping lifecycle + methods outside
+/// the profile allowlist), in input order — the list the response matching is run against, so a
+/// dropped stored request is never expected in the replay responses.
+fn cold_replay_stored_messages(
+    input: &LspInput,
+    profile: &ScalaExecutionProfile,
+) -> Vec<crate::lsp::LspMessage> {
+    input
+        .messages
+        .iter()
+        .filter(|m| is_replayed(m.method(), profile))
+        .cloned()
+        .collect()
 }
 
 /// Parse every complete `Content-Length`-framed LSP payload from `bytes` (stopping at the first
@@ -573,19 +625,16 @@ fn parse_lsp_payloads(bytes: &[u8]) -> Vec<JsonRPCMessage> {
     messages
 }
 
-/// Derive the JSON-RPC error findings from a replay's received messages, using the same
-/// request/response matching (and the same 1-based stored-request numbering) as the native path.
-/// `backdrop_root` (index mode) scopes frozen-source URI lifting exactly like the fuzzing path.
+/// Derive the JSON-RPC error findings from a replay's received messages, matching them against the
+/// SAME filtered stored requests that were actually sent (`stored`), with the same 1-based
+/// stored-request numbering as the native path so a dropped request is never expected. `backdrop_root`
+/// (index mode) scopes frozen-source URI lifting exactly like the fuzzing path.
 fn replay_findings(
-    input: &LspInput,
+    stored: &[crate::lsp::LspMessage],
     received: &[JsonRPCMessage],
     backdrop_root: Option<&str>,
 ) -> FindingSet {
-    match RequestResponseMatching::match_messages(
-        input.messages.iter(),
-        received.iter(),
-        backdrop_root,
-    ) {
+    match RequestResponseMatching::match_messages(stored.iter(), received.iter(), backdrop_root) {
         Ok(matching) => {
             findings_from_json_rpc_errors(matching.errors.iter().map(|(m, e)| (m.method(), e)))
         }
@@ -1008,6 +1057,138 @@ mod tests {
             replay_script("cat >/dev/null; sleep 30", Duration::from_millis(400)),
             OutcomeClass::TimeoutOrDeadlock
         );
+    }
+
+    // Stderr well beyond the cap does not blow up the driver, and only the retained prefix classifies:
+    // a `FATAL` marker written AFTER the cap is dropped (so a hard JVM fatal, not a logged fatal),
+    // proving truncation; a marker WITHIN the cap still classifies.
+    #[test]
+    fn cold_replay_bounds_stderr_capture() {
+        let t = Duration::from_secs(10);
+        // ~70 KiB of 'x' (> 64 KiB cap), then a late FATAL beyond the cap.
+        assert_eq!(
+            replay_script(
+                "cat >/dev/null; head -c 70000 /dev/zero | tr '\\0' 'x' >&2; echo 'FATAL late' >&2; exit 1",
+                t
+            ),
+            OutcomeClass::JvmFatal,
+            "a FATAL emitted past the cap must be truncated away, not classified"
+        );
+        // The same marker within the retained prefix is still classified.
+        assert_eq!(
+            replay_script(
+                "cat >/dev/null; echo 'FATAL early' >&2; head -c 70000 /dev/zero | tr '\\0' 'x' >&2; exit 1",
+                t
+            ),
+            OutcomeClass::LoggedFatal
+        );
+    }
+
+    fn request(method: &str, params: serde_json::Value) -> crate::lsp::LspMessage {
+        crate::lsp::LspMessage::try_from_json(method, params).unwrap()
+    }
+
+    fn position_params(uri: &str) -> serde_json::Value {
+        serde_json::json!({
+            "textDocument": { "uri": uri },
+            "position": { "line": 0, "character": 0 },
+        })
+    }
+
+    // The methods actually sent to the entrypoint, in order, from a built cold-replay stream.
+    fn replayed_methods(input: &LspInput, profile: &ScalaExecutionProfile) -> Vec<(String, bool)> {
+        let dir = tempfile::tempdir().unwrap();
+        let stream = build_cold_replay_stream(input, profile, "file:///root", dir.path());
+        parse_lsp_payloads(&stream)
+            .iter()
+            .map(|m| match m {
+                JsonRPCMessage::Request { method, .. } => (method.to_string(), true),
+                JsonRPCMessage::Notification { method, .. } => (method.to_string(), false),
+                JsonRPCMessage::Response { .. } => ("<response>".to_string(), false),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn cold_replay_drops_disallowed_stored_requests_pc_mode() {
+        // A pc-mode input carrying an index-only stored request (workspace/symbol) alongside an
+        // allowed hover: cold replay must send hover but drop workspace/symbol.
+        let mut input = LspInput::default();
+        input.messages.push(request(
+            "textDocument/hover",
+            position_params("lsp-fuzz://a.scala"),
+        ));
+        input.messages.push(request(
+            "workspace/symbol",
+            serde_json::json!({ "query": "x" }),
+        ));
+        let methods = replayed_methods(&input, &ScalaExecutionProfile::presentation_compiler());
+        assert!(
+            !methods.iter().any(|(m, _)| m == "workspace/symbol"),
+            "an index-only request must not reach the entrypoint in pc mode: {methods:?}"
+        );
+        assert!(
+            methods
+                .iter()
+                .any(|(m, is_req)| m == "textDocument/hover" && *is_req)
+        );
+    }
+
+    #[test]
+    fn cold_replay_drops_disallowed_stored_requests_index_mode() {
+        // An index-mode input carrying a pc-only stored request (textDocument/completion) alongside
+        // an allowed references: cold replay must send references but drop completion.
+        let mut input = LspInput::default();
+        input.messages.push(request("textDocument/references", {
+            let mut p = position_params("lsp-fuzz://a.scala");
+            p["context"] = serde_json::json!({ "includeDeclaration": true });
+            p
+        }));
+        input.messages.push(request(
+            "textDocument/completion",
+            position_params("lsp-fuzz://a.scala"),
+        ));
+        let methods = replayed_methods(&input, &ScalaExecutionProfile::index());
+        assert!(
+            !methods.iter().any(|(m, _)| m == "textDocument/completion"),
+            "a pc-only request must not reach the entrypoint in index mode: {methods:?}"
+        );
+        assert!(
+            methods
+                .iter()
+                .any(|(m, is_req)| m == "textDocument/references" && *is_req)
+        );
+    }
+
+    #[test]
+    fn cold_replay_stream_ids_line_up_with_matching() {
+        // The first sent stored request must get id 1 (the profile initialize is id 0), matching the
+        // 1-based numbering RequestResponseMatching uses over the filtered stored list.
+        let mut input = LspInput::default();
+        input.messages.push(request(
+            "workspace/symbol",
+            serde_json::json!({ "query": "x" }),
+        )); // dropped in pc
+        input.messages.push(request(
+            "textDocument/hover",
+            position_params("lsp-fuzz://a.scala"),
+        )); // sent
+        let profile = ScalaExecutionProfile::presentation_compiler();
+        let dir = tempfile::tempdir().unwrap();
+        let stream = build_cold_replay_stream(&input, &profile, "file:///root", dir.path());
+        let hover_id = parse_lsp_payloads(&stream)
+            .into_iter()
+            .find_map(|m| match m {
+                JsonRPCMessage::Request { id, method, .. } if method == "textDocument/hover" => {
+                    Some(id)
+                }
+                _ => None,
+            });
+        assert_eq!(hover_id, Some(crate::lsp::json_rpc::MessageId::Number(1)));
+        // The filtered stored list keeps only the allowed request, so matching numbers it as id 1.
+        let stored = cold_replay_stored_messages(&input, &profile);
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].method(), "textDocument/hover");
     }
 
     // Build a minimal fake frozen backdrop with the markers the index materializer verifies.
