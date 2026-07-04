@@ -64,10 +64,20 @@ where
         worker: JvmWorker<T>,
         respawn: impl FnMut() -> Result<T, WorkerError> + 'static,
     ) -> Self {
+        Self::with_observer(worker, respawn, jvm_coverage_observer("jvm-edges"))
+    }
+
+    /// Like [`JvmLspExecutor::new`] but adopts a caller-provided coverage observer, so the caller can
+    /// build the map feedback from the same observer (by name) before the executor takes ownership.
+    pub fn with_observer(
+        worker: JvmWorker<T>,
+        respawn: impl FnMut() -> Result<T, WorkerError> + 'static,
+        observer: JvmCoverageObserver,
+    ) -> Self {
         JvmLspExecutor {
             worker,
             respawn: Box::new(respawn),
-            observers: (jvm_coverage_observer("jvm-edges"), ()),
+            observers: (observer, ()),
             _phantom: PhantomData,
         }
     }

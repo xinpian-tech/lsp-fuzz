@@ -14,14 +14,14 @@ use libafl::{
     corpus::Corpus,
     events::SimpleEventManager,
     feedback_or,
-    feedbacks::{MaxMapFeedback, TimeFeedback},
+    feedbacks::{CrashFeedback, MaxMapFeedback, TimeFeedback},
     monitors::SimpleMonitor,
     mutators::HavocScheduledMutator,
     observers::{
         AsanBacktraceObserver, CanTrack, HitcountsMapObserver, StdMapObserver, TimeObserver,
     },
-    schedulers::powersched::BaseSchedule,
-    stages::{CalibrationStage, StdPowerMutationalStage},
+    schedulers::{QueueScheduler, powersched::BaseSchedule},
+    stages::{CalibrationStage, StdMutationalStage, StdPowerMutationalStage},
     state::{HasCorpus, StdState},
 };
 use libafl_bolts::{
@@ -30,10 +30,13 @@ use libafl_bolts::{
     shmem::{ShMem, ShMemProvider, StdShMemProvider},
 };
 use lsp_fuzz::{
-    corpus::{TestCaseFileNameFeedback, corpus_kind::CORPUS},
+    corpus::{
+        TestCaseFileNameFeedback,
+        corpus_kind::{CORPUS, SOLUTION},
+    },
     execution::{
-        FuzzExecutionConfig, FuzzInput, LspExecutor, responses::LspOutputObserver,
-        workspace_observer::WorkspaceObserver,
+        FuzzExecutionConfig, FuzzInput, LspExecutor, jvm, jvm_executor,
+        responses::LspOutputObserver, workspace_observer::WorkspaceObserver,
     },
     fuzz_target,
     lsp::GeneratorsConfig,
@@ -104,6 +107,12 @@ pub(super) struct FuzzCommand {
 
     #[clap(long, value_parser = parse_hash_map::<Language, PathBuf>)]
     language_fragments: HashMap<Language, PathBuf>,
+
+    /// Fuzz a JVM language-server target through the persistent coverage worker instead of the
+    /// native AFL fork server. The value is the full worker command (whitespace-separated), e.g.
+    /// `"java -cp out cov.Worker"`. In this mode the native ELF/AFL binary checks are skipped.
+    #[clap(long)]
+    jvm_worker: Option<String>,
 }
 
 impl FuzzCommand {
@@ -113,6 +122,11 @@ impl FuzzCommand {
     )]
     pub(super) fn run(self, global_options: GlobalOptions) -> Result<(), anyhow::Error> {
         self.state.create().context("Crating state dir")?;
+        // A JVM target is driven through a persistent coverage worker, not the AFL fork server, so
+        // it must not go through the native ELF/AFL binary inspection below.
+        if self.jvm_worker.is_some() {
+            return self.run_jvm_mode(global_options);
+        }
         let mut shmem_provider =
             StdShMemProvider::new().context("Creating shared memory provider")?;
 
@@ -285,6 +299,125 @@ impl FuzzCommand {
                 Ok(())
             }
             err @ Err(_) => err.context("In fuzz loop"),
+        }
+    }
+
+    /// Fuzz a JVM language-server target through the persistent coverage worker. No native ELF/AFL
+    /// binary inspection: coverage comes from the worker's mmap map surfaced through
+    /// [`JvmLspExecutor`], and crashes are the fuzzing objective.
+    fn run_jvm_mode(self, global_options: GlobalOptions) -> Result<(), anyhow::Error> {
+        let worker_cmd: Vec<String> = self
+            .jvm_worker
+            .as_deref()
+            .unwrap_or_default()
+            .split_whitespace()
+            .map(str::to_owned)
+            .collect();
+        let (program, args) = worker_cmd
+            .split_first()
+            .context("--jvm-worker must name a worker program")?;
+        let program = program.clone();
+        let args = args.to_vec();
+
+        let grammar_ctx =
+            load_grammar_lookup(&self.language_fragments).context("Creating grammar context")?;
+
+        let temp_dir = self.temp_dir.clone().unwrap_or_else(std::env::temp_dir);
+        let map_path = temp_dir.join(format!("jvm-cov-{}.bin", std::process::id()));
+
+        // The worker publishes its coverage map at $COV_MAP_PATH; the executor copies from there.
+        let spawn_worker = {
+            let program = program.clone();
+            let args = args.clone();
+            let map_path = map_path.clone();
+            move || {
+                let mut command = std::process::Command::new(&program);
+                command.args(&args).env("COV_MAP_PATH", &map_path);
+                jvm::SubprocessTransport::spawn(command)
+            }
+        };
+        let transport = spawn_worker().context("Spawning JVM worker")?;
+        let worker = jvm::JvmWorker::new(transport, &map_path, Duration::from_secs(30));
+
+        let cov_observer = jvm_executor::jvm_coverage_observer("jvm-edges");
+        let map_feedback = MaxMapFeedback::new(&cov_observer);
+        let mut feedback = feedback_or!(map_feedback, TestCaseFileNameFeedback::<CORPUS>::new());
+        let mut objective = feedback_or!(
+            TestCaseFileNameFeedback::<SOLUTION>::new(),
+            CrashFeedback::new()
+        );
+
+        let (corpus, solutions) =
+            common::create_corpus(&self.state.corpus_dir(), &self.state.solution_dir())
+                .context("Creating corpus")?;
+        let random_seed = global_options
+            .random_seed
+            .unwrap_or_else(libafl_bolts::current_nanos);
+        let mut state = StdState::new(
+            StdRand::with_seed(random_seed),
+            corpus,
+            solutions,
+            &mut feedback,
+            &mut objective,
+        )
+        .context("Creating state")?;
+
+        let mut fuzzer = StdFuzzerBuilder::new()
+            .input_filter(NopInputFilter)
+            .target_bytes_converter(LspInputBytesConverter::new(temp_dir))
+            .scheduler(QueueScheduler::new())
+            .feedback(feedback)
+            .objective(objective)
+            .build();
+
+        let mut executor =
+            jvm_executor::JvmLspExecutor::with_observer(worker, spawn_worker, cov_observer);
+
+        let mut fuzz_stages = {
+            let generators_config = GeneratorsConfig::full();
+            let text_document_mutator = HavocScheduledMutator::with_max_stack_pow(
+                text_document_mutations(&grammar_ctx, &generators_config),
+                6,
+            );
+            let messages_mutator =
+                HavocScheduledMutator::with_max_stack_pow(message_mutations(&generators_config), 3);
+            let mutator = LspInputMutator::new(text_document_mutator, messages_mutator);
+            let mutation_stage = StdMutationalStage::new(mutator);
+            let timeout_stop = TimeoutStopStage::new(Duration::from_hours(self.time_budget));
+            let trigger_stop = common::trigger_stop_stage()?;
+            tuple_list![mutation_stage, timeout_stop, trigger_stop]
+        };
+
+        let mut event_manager = SimpleEventManager::new(SimpleMonitor::new(|it| info!("{}", it)));
+
+        if state.must_load_initial_inputs() {
+            info!("Generating seeds");
+            let mut generator = LspInputGenerator::new(&grammar_ctx);
+            state
+                .generate_initial_inputs_forced(
+                    &mut fuzzer,
+                    &mut executor,
+                    &mut generator,
+                    &mut event_manager,
+                    self.generate_seeds,
+                )
+                .context("Generating initial input")?;
+        }
+
+        common::set_cpu_affinity(self.cpu_affinity);
+
+        match fuzzer.fuzz_loop(
+            &mut fuzz_stages,
+            &mut executor,
+            &mut state,
+            &mut event_manager,
+        ) {
+            Ok(()) => unreachable!("The fuzz loop will never exit with Ok"),
+            Err(libafl::Error::ShuttingDown) => {
+                info!("Stop requested. {} will now exit.", crate::PROGRAM_NAME);
+                Ok(())
+            }
+            err @ Err(_) => err.context("In JVM fuzz loop"),
         }
     }
 
