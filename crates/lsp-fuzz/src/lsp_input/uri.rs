@@ -23,7 +23,23 @@ pub fn virtual_uri_for_path(path: &Path) -> Option<Uri> {
         .ok()
 }
 
-/// Converts a localized workspace URI back into the virtual `lsp-fuzz://` form.
+/// The frozen backdrop's source directory segment (see `docs/zaozi-backdrop.md`). An index-mode
+/// response URI for a backdrop source carries no per-input workspace segment, so it is lifted to a
+/// stable, location-independent virtual form rooted here.
+const BACKDROP_SOURCES_SEGMENT: &str = "/sources/";
+
+/// Converts a localized response URI back into the virtual `lsp-fuzz://` form.
+///
+/// Two origins are recognized:
+/// - a per-input workspace/overlay file (`…/lsp-fuzz-workspace_<hash>/<rel>`) lifts to
+///   `lsp-fuzz:///<rel>`;
+/// - a frozen backdrop source file (`…/sources/<rel>`, index mode) lifts to the stable
+///   `lsp-fuzz:///backdrop/sources/<rel>` — location-independent, so index responses fit the virtual
+///   workspace model instead of leaking an absolute backdrop `file://` path.
+///
+/// Any other URI is returned unchanged. The workspace-segment branch takes precedence, so
+/// generic/native paths (always under `lsp-fuzz-workspace_`) lift exactly as before even if the
+/// input workspace itself contains a `sources/` directory.
 ///
 /// # Panics
 ///
@@ -36,6 +52,11 @@ pub fn lift_uri(uri: &Uri) -> Cow<'_, Uri> {
             .find('/')
             .map_or(uri_str.len(), |it| it + index + 1);
         let lifted = format!("{}/{}", LspInput::PROTOCOL_PREFIX, &uri_str[in_workspace..]);
+        Cow::Owned(lifted.parse().unwrap())
+    } else if let Some(index) = uri_str.find(BACKDROP_SOURCES_SEGMENT) {
+        // Keep from `sources/` onward (drop the leading '/').
+        let from_sources = &uri_str[index + 1..];
+        let lifted = format!("{}/backdrop/{}", LspInput::PROTOCOL_PREFIX, from_sources);
         Cow::Owned(lifted.parse().unwrap())
     } else {
         Cow::Borrowed(uri)
@@ -58,7 +79,35 @@ mod tests {
 
     use lsp_types::Uri;
 
-    use super::{virtual_uri_for_path, workspace_uri};
+    use super::{lift_uri, virtual_uri_for_path, workspace_uri};
+
+    fn lift(raw: &str) -> String {
+        lift_uri(&raw.parse::<Uri>().unwrap()).as_str().to_owned()
+    }
+
+    #[test]
+    fn lift_overlay_and_backdrop_source_uris() {
+        // A per-input overlay file (index mode) lifts via its workspace segment.
+        assert_eq!(
+            lift("file:///tmp/zaozi-backdrop/.lsp-fuzz-overlay/lsp-fuzz-workspace_9/main.scala"),
+            "lsp-fuzz:///main.scala"
+        );
+        // A frozen backdrop source file lifts to the stable, location-independent virtual form.
+        assert_eq!(
+            lift("file:///nix/store/abc-zaozi-backdrop/sources/rvdecoderdb/X.scala"),
+            "lsp-fuzz:///backdrop/sources/rvdecoderdb/X.scala"
+        );
+        // The workspace segment wins even if the input workspace itself has a `sources/` dir.
+        assert_eq!(
+            lift("file:///tmp/lsp-fuzz-workspace_7/sources/a/B.scala"),
+            "lsp-fuzz:///sources/a/B.scala"
+        );
+        // An unrelated URI (no workspace segment, no backdrop sources) is returned unchanged.
+        assert_eq!(
+            lift("file:///nix/store/scala-library/src/Predef.scala"),
+            "file:///nix/store/scala-library/src/Predef.scala"
+        );
+    }
 
     #[test]
     fn create_virtual_uri_for_workspace_path() {
