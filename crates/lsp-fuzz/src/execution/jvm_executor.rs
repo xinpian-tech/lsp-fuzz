@@ -19,7 +19,7 @@ use libafl::{
 use libafl_bolts::{AsSliceMut, Named, tuples::RefIndexable};
 use serde::{Deserialize, Serialize};
 
-use super::jvm::{JvmWorker, MAP_SIZE, WorkerError, WorkerTransport};
+use super::jvm::{JvmWorker, LifecycleOutcome, MAP_SIZE, WorkerError, WorkerTransport};
 use super::outcome::OutcomeClass;
 use crate::findings::{FindingSet, findings_from_jvm_side_channel};
 
@@ -199,6 +199,31 @@ where
         }
         Ok(())
     }
+
+    /// Reset the outcome side channel, run `bytes` capturing coverage into the observer's owned map,
+    /// then record the run's outcome class + published findings. Split out of `run_target` so the
+    /// reset→run→record ordering is unit-testable without a full fuzzer/state: the reset MUST precede
+    /// the run so a run that dies before publishing its findings file cannot inherit the previous
+    /// run's findings.
+    fn run_and_record(&mut self, bytes: &[u8]) -> LifecycleOutcome {
+        // Clear the outcome observer + remove any stale side-channel file BEFORE the run. This is the
+        // `pre_exec` hook a stock LibAFL executor would run for us; this custom executor drives it.
+        self.observers.1.0.reset_before_run();
+        // Capture the attributable coverage directly into the observer's owned map (zeroed on any
+        // non-attributable outcome). worker and observers are disjoint fields.
+        let outcome = {
+            let map: &mut [u8] = self.observers.0.as_slice_mut();
+            let map: &mut [u8; MAP_SIZE] = map
+                .try_into()
+                .expect("jvm coverage observer map is MAP_SIZE");
+            self.worker.run_capturing(bytes, map)
+        };
+        // Persist the oracle classification + any JSON-RPC error findings at the observer layer so a
+        // feedback / provenance-export path can consume them (the coverage map already lives in
+        // observer 0). The worker published its findings before replying, so this read is ready.
+        self.observers.1.0.record_after_run(outcome.outcome_class);
+        outcome
+    }
 }
 
 impl<T, I, S> HasObservers for JvmLspExecutor<T, I, S>
@@ -231,19 +256,7 @@ where
         input: &I,
     ) -> Result<ExitKind, libafl::Error> {
         let bytes = fuzzer.target_bytes_converter_mut().to_target_bytes(input);
-        // Run the input and capture the attributable coverage directly into the observer's owned
-        // map (zeroed on any non-attributable outcome). worker and observers are disjoint fields.
-        let outcome = {
-            let map: &mut [u8] = self.observers.0.as_slice_mut();
-            let map: &mut [u8; MAP_SIZE] = map
-                .try_into()
-                .expect("jvm coverage observer map is MAP_SIZE");
-            self.worker.run_capturing(&bytes, map)
-        };
-        // Persist the oracle classification + any JSON-RPC error findings at the observer layer so a
-        // feedback / provenance-export path can consume them (the coverage map already lives in
-        // observer 0). The worker published its findings before replying, so this read is ready.
-        self.observers.1.0.record_after_run(outcome.outcome_class);
+        let outcome = self.run_and_record(&bytes);
         self.restart_if_needed(outcome.restart_required)
             .map_err(|err| {
                 libafl::Error::unknown(format!("failed to restart JVM worker epoch: {err}"))
@@ -325,6 +338,38 @@ mod tests {
         observer.record_after_run(OutcomeClass::JvmFatal);
         assert_eq!(observer.last_outcome(), Some(OutcomeClass::JvmFatal));
         assert!(observer.findings().is_empty());
+    }
+
+    /// A run that dies before the worker publishes its findings file must NOT inherit the previous
+    /// run's side channel: `run_and_record` (driven by `run_target`) resets the outcome observer and
+    /// removes the stale file BEFORE running. Regression for the missing pre-exec reset — without the
+    /// `reset_before_run` call this reads the stale `boom` finding and attributes it to this run.
+    #[test]
+    fn a_run_does_not_inherit_the_previous_runs_findings() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("findings.tsv");
+        // A prior run's published findings still on disk.
+        std::fs::write(&path, "textDocument/hover\t-32603\tboom\n").unwrap();
+
+        let worker = JvmWorker::new(DeadTransport, "/nonexistent/map", Duration::from_secs(1));
+        let mut executor: JvmLspExecutor<DeadTransport, (), ()> = JvmLspExecutor::with_observers(
+            worker,
+            || Err(WorkerError::Protocol),
+            jvm_coverage_observer("jvm-edges-test"),
+            JvmOutcomeObserver::new(Some(path.clone())),
+        );
+
+        // DeadTransport makes the run a protocol failure that publishes nothing (no Java body writes
+        // the file). The reset before the run must clear the stale findings + remove the stale file.
+        let _ = executor.run_and_record(b"any input");
+        assert!(
+            executor.observers.1.0.findings().is_empty(),
+            "a non-publishing run must not inherit the previous run's findings"
+        );
+        assert!(
+            !path.exists(),
+            "the stale side-channel file must be removed before the run"
+        );
     }
 
     /// A required epoch restart whose respawn fails must surface as an error, not a panic, and not a

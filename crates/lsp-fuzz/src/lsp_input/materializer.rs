@@ -79,8 +79,9 @@ impl WorkspaceMaterializer for GenericTempRootMaterializer {
 ///
 /// Coverage/indexing note: the overlay is a per-input *dirty buffer* placed under the
 /// `.lsp-fuzz-overlay/` scratch dir, which is OUTSIDE the frozen, pre-indexed `sources/` tree — so
-/// an overlay file has no SemanticDB of its own. On a substrate that only carries the recovered index and has
-/// no live build server, the index is empty until a build target produces SemanticDB, so semantic
+/// an overlay file has no `SemanticDB` of its own. On a substrate that only carries the recovered
+/// index and has no live build server, the index is empty until a build target produces
+/// `SemanticDB`, so semantic
 /// requests (`textDocument/references`, `textDocument/rename`) over the overlay return
 /// `-32803 "… has no SemanticDB output"`. That path still fuzzes the server's index request
 /// dispatch, lifecycle, and error-oracle surface (a crash there is a genuine finding); the semantic

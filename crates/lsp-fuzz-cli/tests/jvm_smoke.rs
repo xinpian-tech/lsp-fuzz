@@ -66,6 +66,78 @@ fn jvm_mode_rejects_worker_argv_without_determinism_flags() {
     );
 }
 
+/// A fuzz option placed AFTER `--jvm-worker` is greedily swallowed into the variadic worker argv.
+/// The CLI must reject this loudly (needs no JDK: the guard fires before any worker is spawned)
+/// rather than silently running with `scala_mode` at its default.
+#[test]
+fn jvm_worker_swallowing_a_fuzz_option_is_rejected() {
+    let state = tempfile::tempdir().expect("tempdir");
+    let output = Command::new(env!("CARGO_BIN_EXE_lsp-fuzz-cli"))
+        .args([
+            "fuzz",
+            "--state",
+            state.path().to_str().unwrap(),
+            "--time-budget",
+            "0",
+            "--jvm-worker",
+            "java",
+            "-cp",
+            "/nonexistent/ls.jar",
+            "cov.Worker",
+            // Placed after --jvm-worker → swallowed into the worker argv.
+            "--scala-mode",
+            "index",
+        ])
+        .output()
+        .expect("run CLI");
+    assert!(
+        !output.status.success(),
+        "a --scala-mode swallowed into the worker argv must be rejected"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("--scala-mode") && stderr.contains("jvm-worker"),
+        "the error must explain the swallowed --scala-mode; got:\n{stderr}"
+    );
+}
+
+/// A `;` terminator ends the worker argv so later options are parsed normally: `--scala-mode` is no
+/// longer swallowed (the guard does not fire) and the run proceeds to the determinism-flag check.
+#[test]
+fn jvm_worker_terminator_lets_later_options_parse() {
+    let state = tempfile::tempdir().expect("tempdir");
+    let output = Command::new(env!("CARGO_BIN_EXE_lsp-fuzz-cli"))
+        .args([
+            "fuzz",
+            "--state",
+            state.path().to_str().unwrap(),
+            "--time-budget",
+            "0",
+            "--jvm-worker",
+            "java",
+            "-cp",
+            "/nonexistent/ls.jar",
+            "cov.Worker",
+            ";",
+            "--scala-mode",
+            // `pc` has no required env, so the run deterministically reaches the determinism gate
+            // (index mode would fail earlier on its required env). Either way --scala-mode parsed.
+            "pc",
+        ])
+        .output()
+        .expect("run CLI");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    // --scala-mode parsed as an option (guard silent), so the run reaches the determinism-flag gate.
+    assert!(
+        !stderr.contains("consumed as --jvm-worker argv"),
+        "the terminator must stop --scala-mode being swallowed; got:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("determinism"),
+        "with --scala-mode parsed, the missing determinism flags must be the failure; got:\n{stderr}"
+    );
+}
+
 #[test]
 #[allow(clippy::too_many_lines, reason = "linear end-to-end smoke setup")]
 fn jvm_mode_fuzz_smoke_reaches_loop_without_deadlock() {

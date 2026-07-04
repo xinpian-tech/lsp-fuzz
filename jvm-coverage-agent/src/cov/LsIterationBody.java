@@ -40,7 +40,8 @@ public final class LsIterationBody implements IterationBody {
     private boolean started;
     private boolean initializedSent;
     private Object endpoint; // org.eclipse.lsp4j.jsonrpc.RemoteEndpoint (implements Endpoint)
-    private final List<String> openDocuments = new ArrayList<>();
+    // A Set so a repeated didOpen for the same URI is not closed twice by the per-iteration reset.
+    private final java.util.Set<String> openDocuments = new java.util.LinkedHashSet<>();
     // The profile's method allowlist for the current input; a stored message outside it is dropped.
     private java.util.Set<String> allowedMethods = java.util.Set.of();
     // Request methods forwarded and completed during the current input, published to
@@ -141,6 +142,15 @@ public final class LsIterationBody implements IterationBody {
             String uri = documentUri(params);
             if (uri != null) {
                 openDocuments.add(uri);
+            }
+        } else if ("textDocument/didClose".equals(method)) {
+            notifyServer(method, params);
+            // The input closed this document itself, so drop it from the open set — otherwise the
+            // next iteration's reset would close it again after Cov.reset, crediting this input's
+            // cleanup to the following input.
+            String uri = documentUri(params);
+            if (uri != null) {
+                openDocuments.remove(uri);
             }
         } else if (isRequest) {
             requestAndWait(method, params, deadlineNanos);

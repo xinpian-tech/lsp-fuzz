@@ -112,7 +112,12 @@ pub(super) struct FuzzCommand {
     /// native AFL fork server. Give the full worker argv (the program then its arguments), e.g.
     /// `--jvm-worker java -cp out cov.Worker`. When present, the native ELF/AFL binary checks and
     /// `--lsp-executable` are skipped; each token is preserved as a separate argv entry.
-    #[clap(long, num_args = 1.., allow_hyphen_values = true)]
+    ///
+    /// Because the argv is variadic and accepts hyphen-prefixed tokens, it greedily consumes
+    /// everything after it. Put other fuzz options (e.g. `--scala-mode`) BEFORE `--jvm-worker`, or
+    /// terminate the worker argv with a `;` token so later options are parsed normally, e.g.
+    /// `--jvm-worker java -cp out cov.Worker ';' --scala-mode index`.
+    #[clap(long, num_args = 1.., allow_hyphen_values = true, value_terminator = ";")]
     jvm_worker: Vec<String>,
 
     /// The Scala language-server mode for JVM fuzzing: `pc` (presentation compiler, the default) or
@@ -131,6 +136,21 @@ impl FuzzCommand {
         // A JVM target is driven through a persistent coverage worker, not the AFL fork server, so
         // it must not go through the native ELF/AFL binary inspection below.
         if !self.jvm_worker.is_empty() {
+            // The variadic worker argv greedily consumes hyphen-prefixed tokens, so a fuzz option
+            // placed after `--jvm-worker` is silently swallowed into the worker argv (leaving, e.g.,
+            // `scala_mode` at its default). `--scala-mode` never belongs in a JVM worker command, so
+            // finding it there means it was swallowed — fail loudly instead of running misconfigured.
+            if let Some(pos) = self
+                .jvm_worker
+                .iter()
+                .position(|a| a == "--scala-mode" || a.starts_with("--scala-mode="))
+            {
+                anyhow::bail!(
+                    "`--scala-mode` was consumed as --jvm-worker argv (token {pos}) and silently \
+                     ignored. Put fuzz options before --jvm-worker, or terminate the worker argv \
+                     with a ';' token, e.g. `--jvm-worker java -cp out cov.Worker ';' --scala-mode index`."
+                );
+            }
             return self.run_jvm_mode(global_options);
         }
         // Native fork-server mode requires a target binary; the JVM branch above does not.
