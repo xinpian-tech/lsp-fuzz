@@ -436,12 +436,15 @@ const STDERR_CAPTURE_CAP: usize = 64 * 1024;
 /// (`cov::LsIterationBody`: `initialized` once per epoch, then `requestAndWait` for each request, never
 /// `shutdown`/`exit` per input).
 ///
-/// First it writes the handshake (`initialize` + `initialized`) and waits for bootstrap readiness
-/// (`ready_rx`, fed by the stderr reader); firing everything at once races the async bootstrap and
-/// yields a spurious `-32803 "workspace is not ready"` instead of the genuine outcome. Then it replays
-/// each step in order: a notification is written and left, while a request is written alone and its
-/// exact response id (from `resp_id_rx`, fed by the stdout reader) is awaited before the next frame —
-/// so a later/out-of-order response can never let teardown cut off an earlier request. Finally it
+/// It writes `initialize` and AWAITS its response (id 0) before sending `initialized` — mirroring
+/// `ensureInitialized`, so the server never receives `initialized` before answering `initialize`. In
+/// index mode it then waits for the async BSP/index bootstrap readiness marker on stderr (`ready_rx`,
+/// fed by the stderr reader) before any request, so requests do not race the bootstrap into a spurious
+/// `-32803 "workspace is not ready"`; PC mode never prints that marker, so it proceeds straight to the
+/// steps (waiting for it would burn the whole deadline and misclassify the run as a timeout). Then it
+/// replays each step in order: a notification is written and left, while a request is written alone and
+/// its exact response id (from `resp_id_rx`, fed by the stdout reader) is awaited before the next frame
+/// — so a later/out-of-order response can never let teardown cut off an earlier request. Finally it
 /// writes `shutdown`/`exit`, only after every request step has replied or the deadline expired. Every
 /// wait is bounded by a single overall `deadline` so a broken/hung server can never hang us. Generic
 /// over the writer so the ordering is directly testable against an in-memory recording writer.
@@ -454,20 +457,12 @@ fn drive_replay_writes<W: Write>(
 ) {
     let deadline_at = Instant::now() + deadline;
     let remaining = || deadline_at.saturating_duration_since(Instant::now());
-    let _ = writer.write_all(&frames.handshake);
-    let _ = writer.flush();
     // Track which response ids have arrived (a later one may precede the request currently awaited),
     // so awaiting an id already seen returns immediately.
     let mut seen = std::collections::HashSet::new();
-    if frames.wait_for_bsp_ready {
-        // Index mode: the async BSP/index bootstrap logs a readiness marker on stderr; wait for it so
-        // requests do not race the bootstrap into a spurious `-32803 "workspace is not ready"`.
-        let _ = ready_rx.recv_timeout(remaining());
-    } else {
-        // PC mode: no BSP bootstrap marker is ever printed, so waiting for it would burn the whole
-        // deadline. Instead mirror the warm worker's `ensureInitialized` (which awaits the initialize
-        // future) by awaiting the `initialize` response (id 0) before sending any request.
-        while !seen.contains(&COLD_REPLAY_INITIALIZE_ID) {
+    // Await response `target`, remembering any other ids that arrive first, bounded by the deadline.
+    let await_response = |target: usize, seen: &mut std::collections::HashSet<usize>| {
+        while !seen.contains(&target) {
             let wait = remaining();
             if wait.is_zero() {
                 break;
@@ -476,26 +471,33 @@ fn drive_replay_writes<W: Write>(
                 Ok(rid) => {
                     seen.insert(rid);
                 }
-                Err(_) => break,
+                Err(_) => break, // deadline or reader gone: stop awaiting
             }
         }
+    };
+
+    // initialize, and AWAIT its response before `initialized` — mirrors the warm worker's
+    // `ensureInitialized` so the server never receives `initialized` before answering `initialize`.
+    let _ = writer.write_all(&frames.initialize);
+    let _ = writer.flush();
+    await_response(COLD_REPLAY_INITIALIZE_ID, &mut seen);
+
+    // initialized (in index mode this kicks off the async BSP/index bootstrap).
+    let _ = writer.write_all(&frames.initialized);
+    let _ = writer.flush();
+
+    // Index mode then waits for the BSP/index bootstrap readiness marker on stderr before any request,
+    // so requests do not race the bootstrap into a spurious `-32803 "workspace is not ready"`. PC mode
+    // never prints that marker (and initialize is already awaited above), so it proceeds to the steps.
+    if frames.wait_for_bsp_ready {
+        let _ = ready_rx.recv_timeout(remaining());
     }
+
     for step in &frames.steps {
         let _ = writer.write_all(step.bytes());
         let _ = writer.flush();
         if let ReplayStep::Request { id, .. } = step {
-            while !seen.contains(id) {
-                let wait = remaining();
-                if wait.is_zero() {
-                    break;
-                }
-                match resp_id_rx.recv_timeout(wait) {
-                    Ok(rid) => {
-                        seen.insert(rid);
-                    }
-                    Err(_) => break, // deadline or reader gone: stop awaiting, tear down
-                }
-            }
+            await_response(*id, &mut seen);
         }
     }
     let _ = writer.write_all(&frames.teardown);
@@ -709,7 +711,8 @@ fn build_cold_replay_stream(
     localization_dir: &Path,
 ) -> Vec<u8> {
     let frames = build_cold_replay_frames(input, profile, root_uri, localization_dir);
-    let mut stream = frames.handshake;
+    let mut stream = frames.initialize;
+    stream.extend(frames.initialized);
     for step in &frames.steps {
         stream.extend_from_slice(step.bytes());
     }
@@ -749,8 +752,13 @@ impl ReplayStep {
 
 /// The parts of a cold-replay stream, written with barriers between them (see [`cold_replay`]).
 struct ColdReplayFrames {
-    /// `initialize` (id 0) + `initialized`, sent first.
-    handshake: Vec<u8>,
+    /// `initialize` (id 0), sent first and AWAITED (its response) before `initialized` — a server may
+    /// otherwise receive `initialized` before it has answered `initialize`, unlike the warm worker's
+    /// `ensureInitialized`.
+    initialize: Vec<u8>,
+    /// `initialized`, sent only after the `initialize` response. In index mode this kicks off the
+    /// async BSP/index bootstrap whose readiness is then awaited on stderr.
+    initialized: Vec<u8>,
     /// The filtered didOpens + stored requests in input order, replayed AFTER the server signals
     /// readiness. Requests are sent one at a time and each is awaited before the next frame, exactly
     /// like [`cov::LsIterationBody`]'s per-request `requestAndWait` loop.
@@ -785,14 +793,15 @@ fn build_cold_replay_frames(
         .map(|p| format!("file://{p}"))
         .unwrap_or_default();
     let mut id = COLD_REPLAY_INITIALIZE_ID;
-    // The handshake: the profile-supplied initialize (id 0) + initialized, sent first.
-    let mut handshake =
+    // The handshake, split so the driver can await the `initialize` response before sending
+    // `initialized` (mirroring the warm worker's `ensureInitialized`): the profile-supplied
+    // initialize (id 0), then the initialized notification.
+    let initialize =
         JsonRPCMessage::request(id, "initialize".into(), profile.initialize_params(root_uri))
             .to_lsp_payload();
     id += 1;
-    handshake.extend(
-        JsonRPCMessage::notification("initialized".into(), serde_json::json!({})).to_lsp_payload(),
-    );
+    let initialized =
+        JsonRPCMessage::notification("initialized".into(), serde_json::json!({})).to_lsp_payload();
     // The steps: generated didOpens + stored messages (filtered by the profile allowlist like the
     // worker), in input order. Each is a request (awaited by id) or a notification (fire-and-forget).
     let mut steps = Vec::new();
@@ -816,7 +825,8 @@ fn build_cold_replay_frames(
         JsonRPCMessage::notification("exit".into(), serde_json::Value::Null).to_lsp_payload(),
     );
     ColdReplayFrames {
-        handshake,
+        initialize,
+        initialized,
         steps,
         teardown,
         // Only index mode brings up the async BSP/index bootstrap whose readiness the server logs.
@@ -1448,10 +1458,8 @@ mod tests {
                 })
                 .collect::<Vec<_>>()
         };
-        assert_eq!(
-            methods(&frames.handshake),
-            vec!["initialize", "initialized"]
-        );
+        assert_eq!(methods(&frames.initialize), vec!["initialize"]);
+        assert_eq!(methods(&frames.initialized), vec!["initialized"]);
         assert_eq!(methods(&frames.teardown), vec!["shutdown", "exit"]);
         // One replay step: the references request, awaited, with id 1 (initialize consumed id 0).
         assert_eq!(frames.steps.len(), 1);
@@ -1609,24 +1617,28 @@ mod tests {
             v.iter().any(|(mm, ii)| mm == m && *ii == id)
         };
 
-        // (a) Before readiness the driver has only written the handshake (initialize + initialized);
-        //     PC readiness is the initialize response (id 0), which has not been delivered yet.
-        wait_until(&|v| has(v, "initialized", None), "handshake written");
+        // (a) The driver writes `initialize` and BLOCKS awaiting its response (id 0) before
+        //     `initialized` — so `initialized` and any request must be ABSENT until id 0 is delivered.
+        wait_until(&|v| has(v, "initialize", Some(0)), "initialize written");
+        std::thread::sleep(Duration::from_millis(30));
         {
             let v = written_requests(&buf.lock().unwrap());
-            assert!(has(&v, "initialize", Some(0)) && has(&v, "initialized", None));
+            assert!(
+                !has(&v, "initialized", None),
+                "initialized must not be sent before the initialize response: {v:?}"
+            );
             assert!(
                 !v.iter().any(|(m, _)| m.starts_with("textDocument/")),
-                "no request may be sent before readiness: {v:?}"
+                "no request may be sent before initialize is answered: {v:?}"
             );
         }
 
-        // (b) After the initialize response (id 0) arrives, the driver writes ONLY request id 1 and
-        //     then blocks awaiting its response — request id 2 and shutdown/exit must be absent.
+        // (b) After the initialize response (id 0), the driver writes `initialized`, then ONLY request
+        //     id 1, and blocks awaiting its response — request id 2 and shutdown/exit must be absent.
         resp_tx.send(0).unwrap();
         wait_until(
-            &|v| has(v, "textDocument/hover", Some(1)),
-            "request id 1 written",
+            &|v| has(v, "initialized", None) && has(v, "textDocument/hover", Some(1)),
+            "initialized + request id 1 written",
         );
         {
             let v = written_requests(&buf.lock().unwrap());
@@ -1716,17 +1728,24 @@ mod tests {
         let backdrop = tempfile::tempdir().unwrap();
         fake_backdrop(backdrop.path());
         let capture = backdrop.path().join("captured-stream.bin");
+        // The driver awaits the initialize response (id 0) before `initialized`, so the fake server
+        // must emit that framed response on stdout first (a real server does).
+        let init_response =
+            JsonRPCMessage::response(Some(0usize), Some(serde_json::json!({})), None)
+                .to_lsp_payload();
+        let resp_file = backdrop.path().join("init-response.bin");
+        std::fs::write(&resp_file, &init_response).unwrap();
         let profile = ScalaExecutionProfile::index();
-        // The script captures the request stream the shipped entrypoint would receive, then exits.
+        // The script emits the id-0 response on stdout, then the bootstrap-ready marker on stderr so
+        // the index handshake barrier releases, then captures everything the entrypoint would receive.
         let config = ColdReplayConfig {
             profile: &profile,
             program: "sh".to_string(),
-            // Emit the bootstrap-ready marker first so the handshake barrier releases and the full
-            // stream is written, then capture everything the entrypoint would receive.
             args: vec![
                 "-c".to_string(),
                 format!(
-                    "echo '{LS_BOOTSTRAP_READY_MARKER}' >&2; cat > {} ; exit 0",
+                    "cat {}; echo '{LS_BOOTSTRAP_READY_MARKER}' >&2; cat > {} ; exit 0",
+                    resp_file.display(),
                     capture.display()
                 ),
             ],

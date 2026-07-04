@@ -82,16 +82,22 @@ public final class LsIterationBody implements IterationBody {
             // workspace root and the server is configured exactly as the profile prescribes.
             ensureInitialized(env.initializeParams, deadlineNanos);
 
-            // Per-input document reset: close everything the previous input opened.
+            for (byte[] frame : env.frames) {
+                dispatch(new String(frame, StandardCharsets.UTF_8), deadlineNanos);
+            }
+
+            // Close the documents THIS input opened, within THIS input's coverage window, so the
+            // cleanup is attributed to the input that opened them and the next input starts from a
+            // clean slate. Doing it here (not at the start of the next run) is required for per-input
+            // attribution: the Worker calls Cov.reset(generation) for the next input BEFORE run(), so
+            // closing a prior input's documents there would credit its cleanup coverage (or a crash)
+            // to the following input — and a fresh cold replay, which has none of those prior
+            // documents open, could not reproduce it.
             for (String uri : openDocuments) {
                 notifyServer("textDocument/didClose",
                         json("{\"textDocument\":{\"uri\":" + quote(uri) + "}}"));
             }
             openDocuments.clear();
-
-            for (byte[] frame : env.frames) {
-                dispatch(new String(frame, StandardCharsets.UTF_8), deadlineNanos);
-            }
             publishCompletedRequests();
             findings.publish();
         } catch (RuntimeException e) {
