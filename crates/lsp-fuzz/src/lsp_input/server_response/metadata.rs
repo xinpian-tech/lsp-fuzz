@@ -15,6 +15,9 @@ pub struct LspResponseInfo {
     pub diagnostics: HashSet<Diagnostic>,
     pub param_fragments: ParamFragments,
     pub symbol_ranges: HashSet<SymbolRange>,
+    /// Deduplicated server-side problems observed while matching responses (currently the JSON-RPC
+    /// error responses, each recorded as a [`crate::findings::Finding`]).
+    pub findings: crate::findings::FindingSet,
 }
 
 #[allow(clippy::unsafe_derive_deserialize)]
