@@ -344,6 +344,13 @@ impl FuzzCommand {
         let temp_dir = self.temp_dir.clone().unwrap_or_else(std::env::temp_dir);
         let map_path = temp_dir.join(format!("jvm-cov-{}.bin", std::process::id()));
 
+        // The profile's timeout policy governs the worker: the per-input run budget and quiescence
+        // deadline are passed as env, and the Rust reply deadline is derived from them (not
+        // hard-coded), so index mode actually gets its longer settling windows.
+        let run_timeout_ms = profile.run_timeout_ms();
+        let quiescence_deadline_ms = profile.quiescence_deadline_ms();
+        let worker_reply_deadline = profile.worker_reply_deadline();
+
         // The worker publishes its coverage map at $COV_MAP_PATH; the executor copies from there.
         let spawn_worker = {
             let program = program.clone();
@@ -351,12 +358,19 @@ impl FuzzCommand {
             let map_path = map_path.clone();
             move || {
                 let mut command = std::process::Command::new(&program);
-                command.args(&args).env("COV_MAP_PATH", &map_path);
+                command
+                    .args(&args)
+                    .env("COV_MAP_PATH", &map_path)
+                    .env("COV_RUN_TIMEOUT_MS", run_timeout_ms.to_string())
+                    .env(
+                        "COV_QUIESCE_DEADLINE_MS",
+                        quiescence_deadline_ms.to_string(),
+                    );
                 jvm::SubprocessTransport::spawn(command)
             }
         };
         let transport = spawn_worker().context("Spawning JVM worker")?;
-        let worker = jvm::JvmWorker::new(transport, &map_path, Duration::from_secs(30));
+        let worker = jvm::JvmWorker::new(transport, &map_path, worker_reply_deadline);
 
         let cov_observer = jvm_executor::jvm_coverage_observer("jvm-edges");
         let map_feedback = MaxMapFeedback::new(&cov_observer);

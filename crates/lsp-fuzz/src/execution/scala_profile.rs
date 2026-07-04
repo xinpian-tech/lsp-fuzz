@@ -141,6 +141,26 @@ impl ScalaExecutionProfile {
         }
     }
 
+    /// The per-input run budget in milliseconds (for the worker's `COV_RUN_TIMEOUT_MS`).
+    #[must_use]
+    pub fn run_timeout_ms(&self) -> u64 {
+        u64::try_from(self.run_timeout().as_millis()).unwrap_or(u64::MAX)
+    }
+
+    /// The quiescence deadline in milliseconds (for the worker's `COV_QUIESCE_DEADLINE_MS`).
+    #[must_use]
+    pub fn quiescence_deadline_ms(&self) -> u64 {
+        u64::try_from(self.quiescence_deadline().as_millis()).unwrap_or(u64::MAX)
+    }
+
+    /// How long the Rust driver waits for a worker reply. It must exceed the worker's total
+    /// per-input processing (run + quiescence + snapshot/late-watch/protocol slack), so it is derived
+    /// from the profile rather than hard-coded.
+    #[must_use]
+    pub fn worker_reply_deadline(&self) -> Duration {
+        self.run_timeout() + self.quiescence_deadline() + Duration::from_secs(5)
+    }
+
     /// Environment variables this mode requires to be set before it can run.
     #[must_use]
     pub fn required_env(&self) -> &'static [&'static str] {
@@ -358,6 +378,19 @@ mod tests {
         let on = ScalaExecutionProfile::presentation_compiler()
             .apply_generation_policy(GeneratorsConfig::full());
         assert!(on.invalid_input.positions);
+    }
+
+    #[test]
+    fn timeout_policy_is_per_mode_and_applied() {
+        let pc = ScalaExecutionProfile::presentation_compiler();
+        let index = ScalaExecutionProfile::index();
+        assert_eq!(pc.run_timeout_ms(), 30_000);
+        assert_eq!(pc.quiescence_deadline_ms(), 1_000);
+        assert_eq!(index.run_timeout_ms(), 60_000);
+        assert_eq!(index.quiescence_deadline_ms(), 3_000);
+        // The transport reply deadline exceeds run + quiescence, and index waits longer than PC.
+        assert!(pc.worker_reply_deadline() > pc.run_timeout() + pc.quiescence_deadline());
+        assert!(index.worker_reply_deadline() > pc.worker_reply_deadline());
     }
 
     #[test]

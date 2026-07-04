@@ -34,7 +34,7 @@ import java.util.concurrent.TimeUnit;
  * what the real server executes.
  */
 public final class LsIterationBody implements IterationBody {
-    private static final long REQUEST_TIMEOUT_MS = 30_000;
+    private static final long DEFAULT_RUN_TIMEOUT_MS = 30_000;
 
     private boolean started;
     private boolean initializedSent;
@@ -61,11 +61,16 @@ public final class LsIterationBody implements IterationBody {
         Envelope env = Envelope.parse(payload);
         completedRequests.clear();
         allowedMethods = env.allowedMethods;
+        // The profile's per-input run budget (COV_RUN_TIMEOUT_MS) bounds initialize + every replayed
+        // request; when it expires we throw, so the worker returns a non-attributable status and the
+        // driver restarts the epoch.
+        long deadlineNanos = System.nanoTime()
+                + parseMillis(System.getenv("COV_RUN_TIMEOUT_MS"), DEFAULT_RUN_TIMEOUT_MS) * 1_000_000L;
         try {
             // Initialize the epoch once with the profile-supplied params (rooted at the stable root
             // the envelope carries), so every input's documents are opened under the initialized
             // workspace root and the server is configured exactly as the profile prescribes.
-            ensureInitialized(env.initializeParams);
+            ensureInitialized(env.initializeParams, deadlineNanos);
 
             // Per-input document reset: close everything the previous input opened.
             for (String uri : openDocuments) {
@@ -75,7 +80,7 @@ public final class LsIterationBody implements IterationBody {
             openDocuments.clear();
 
             for (byte[] frame : env.frames) {
-                dispatch(new String(frame, StandardCharsets.UTF_8));
+                dispatch(new String(frame, StandardCharsets.UTF_8), deadlineNanos);
             }
             publishCompletedRequests();
         } catch (RuntimeException e) {
@@ -90,18 +95,18 @@ public final class LsIterationBody implements IterationBody {
      * profile-supplied params the envelope carries (rooted at the stable workspace root). Bootstrap
      * degrades gracefully without a BSP/index connection.
      */
-    private void ensureInitialized(String initializeParams) throws Exception {
+    private void ensureInitialized(String initializeParams, long deadlineNanos) throws Exception {
         if (initializedSent) {
             return;
         }
         Object future = endpointRequest.invoke(endpoint, "initialize", json(initializeParams));
-        ((CompletableFuture<?>) future).get(REQUEST_TIMEOUT_MS, TimeUnit.MILLISECONDS);
+        awaitWithinBudget((CompletableFuture<?>) future, deadlineNanos);
         notifyServer("initialized", json("{}"));
         initializedSent = true;
     }
 
     /** Forward one JSON-RPC frame, owning the server lifecycle and enforcing the profile allowlist. */
-    private void dispatch(String body) throws Exception {
+    private void dispatch(String body, long deadlineNanos) throws Exception {
         Object obj = asJsonObject.invoke(jsonParse.invoke(null, body));
         String method = optString(obj, "method");
         if (method == null) {
@@ -128,17 +133,39 @@ public final class LsIterationBody implements IterationBody {
                 openDocuments.add(uri);
             }
         } else if (isRequest) {
-            requestAndWait(method, params);
+            requestAndWait(method, params, deadlineNanos);
         } else {
             notifyServer(method, params);
         }
     }
 
-    private void requestAndWait(String method, Object params) throws Exception {
+    private void requestAndWait(String method, Object params, long deadlineNanos) throws Exception {
         Object future = endpointRequest.invoke(endpoint, method, params);
-        Lifecycle.track((CompletableFuture<?>) future).get(REQUEST_TIMEOUT_MS, TimeUnit.MILLISECONDS);
+        awaitWithinBudget(Lifecycle.track((CompletableFuture<?>) future), deadlineNanos);
         // Record only after the future resolves, so the side channel lists completed requests.
         completedRequests.add(method);
+    }
+
+    /** Wait for {@code future} but never past the per-input run budget. */
+    private static void awaitWithinBudget(CompletableFuture<?> future, long deadlineNanos)
+            throws Exception {
+        long remainingMs = (deadlineNanos - System.nanoTime()) / 1_000_000L;
+        if (remainingMs <= 0) {
+            throw new RuntimeException("per-input run budget exceeded before request completed");
+        }
+        future.get(remainingMs, TimeUnit.MILLISECONDS);
+    }
+
+    /** Parse a millisecond value, falling back when unset/blank/invalid. Package-visible for tests. */
+    static long parseMillis(String raw, long fallback) {
+        if (raw == null || raw.isBlank()) {
+            return fallback;
+        }
+        try {
+            return Long.parseLong(raw.trim());
+        } catch (NumberFormatException e) {
+            return fallback;
+        }
     }
 
     private void notifyServer(String method, Object params) throws Exception {

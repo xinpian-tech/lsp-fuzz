@@ -52,6 +52,7 @@ public final class Harness {
         h.saturationGate();
         h.classReachOracleGate();
         h.lateWriteGuardGate();
+        h.runTimeoutParseGate();
         WorkerHandle w = new WorkerHandle(FAST_WINDOWS);
         try {
             h.coverageGates(w);
@@ -77,6 +78,22 @@ public final class Harness {
     private void fail(String msg) {
         System.out.println("FAIL: " + msg);
         failures++;
+    }
+
+    /**
+     * The per-input run budget must come from {@code COV_RUN_TIMEOUT_MS}, not a hard-coded constant:
+     * the parser honors a provided value and falls back only when unset/blank/invalid.
+     */
+    private void runTimeoutParseGate() {
+        boolean ok = LsIterationBody.parseMillis("45000", 30_000) == 45_000
+                && LsIterationBody.parseMillis(null, 30_000) == 30_000
+                && LsIterationBody.parseMillis("  ", 30_000) == 30_000
+                && LsIterationBody.parseMillis("not-a-number", 30_000) == 30_000;
+        if (ok) {
+            ok("run-timeout budget is read from COV_RUN_TIMEOUT_MS (honors 45000, falls back otherwise)");
+        } else {
+            fail("run-timeout budget parsing did not honor COV_RUN_TIMEOUT_MS");
+        }
     }
 
     /** Saturating counters: hitting one edge >255 times must leave 0xff, never wrap to 0. */
