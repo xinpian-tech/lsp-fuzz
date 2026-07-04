@@ -54,7 +54,7 @@ public final class Worker {
     public static void main(String[] args) throws Exception {
         DataInputStream in = new DataInputStream(new FileInputStream(FileDescriptor.in));
         OutputStream out = new FileOutputStream(FileDescriptor.out);
-        FixtureBody body = new FixtureBody();
+        IterationBody body = selectBody();
         long iterationId = 0;
         // Cross-iteration attribution guard: the write count and generation of the last accepted
         // snapshot, so a late write landing after acceptance but before the next reset is caught.
@@ -113,8 +113,20 @@ public final class Worker {
         }
     }
 
+    /**
+     * Select the per-iteration body. {@code COV_ITERATION_BODY=ls} embeds the real in-process
+     * language server; anything else uses the planted fixture (the default).
+     */
+    private static IterationBody selectBody() {
+        String kind = System.getenv("COV_ITERATION_BODY");
+        if ("ls".equalsIgnoreCase(kind)) {
+            return new LsIterationBody();
+        }
+        return new FixtureBody();
+    }
+
     /** Drive one input through reset → run → quiesce → snapshot → late-watch and classify it. */
-    private static int runIteration(FixtureBody body, byte[] payload, long generation) {
+    private static int runIteration(IterationBody body, byte[] payload, long generation) {
         Lifecycle.reset();
         Cov.reset(generation);
         try {

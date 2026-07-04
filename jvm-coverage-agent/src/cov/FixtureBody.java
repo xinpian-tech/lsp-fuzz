@@ -21,6 +21,8 @@ public final class FixtureBody implements IterationBody {
     private static final int MODE_QUIESCE_TIMEOUT = 0xE1;
     private static final int MODE_LATE_AFTER_SNAPSHOT = 0xE2;
     private static final int MODE_SNAPSHOT_RACE = 0xE3;
+    private static final int MODE_POST_RESET_STALE = 0xE4;
+    private static final int MODE_RELEASE_STALE = 0xE5;
 
     private static final long BACKGROUND_DELAY_MS = 30;
     private static final long NEVER_COMPLETES_MS = 60_000;
@@ -32,6 +34,10 @@ public final class FixtureBody implements IterationBody {
     private CountDownLatch snapshotDone;
     private CountDownLatch lateRelease;
     private CountDownLatch lateDone;
+    // A background thread scheduled under a prior generation, released by a later input to prove a
+    // post-reset stale write is suppressed rather than attributed to the current input.
+    private Thread pendingStale;
+    private CountDownLatch staleGate;
 
     @Override
     public void run(byte[] payload) {
@@ -41,6 +47,9 @@ public final class FixtureBody implements IterationBody {
         lateDone = new CountDownLatch(1);
         int mode = payload.length > 0 ? (payload[0] & 0xff) : -1;
         activeMode = mode;
+        // The generation this input runs under; background work captures it so a write that lands
+        // after a later reset is recognised as stale.
+        long generation = Cov.currentGeneration();
         switch (mode) {
             case MODE_QUIESCE_WAIT -> {
                 // A tracked async task that writes coverage before it completes. Quiescence must
@@ -48,7 +57,7 @@ public final class FixtureBody implements IterationBody {
                 Lifecycle.trackFuture();
                 daemon(() -> {
                     sleepQuiet(BACKGROUND_DELAY_MS);
-                    LateWriteFixture.coverageEdge();
+                    Lifecycle.runInGeneration(generation, LateWriteFixture::coverageEdge);
                     Lifecycle.completeFuture();
                 });
             }
@@ -62,7 +71,7 @@ public final class FixtureBody implements IterationBody {
                 // the late-watch window opens — a late write that must taint the epoch.
                 daemon(() -> {
                     awaitQuiet(lateRelease);
-                    LateWriteFixture.coverageEdge();
+                    Lifecycle.runInGeneration(generation, LateWriteFixture::coverageEdge);
                     lateDone.countDown();
                 });
             }
@@ -71,9 +80,29 @@ public final class FixtureBody implements IterationBody {
                 // before/after digests differ.
                 daemon(() -> {
                     awaitQuiet(snapshotRelease);
-                    LateWriteFixture.coverageEdge();
+                    Lifecycle.runInGeneration(generation, LateWriteFixture::coverageEdge);
                     snapshotDone.countDown();
                 });
+            }
+            case MODE_POST_RESET_STALE -> {
+                // Schedule a background thread that captures THIS generation but parks until a later
+                // input releases it — by then the map has been reset for that later generation.
+                staleGate = new CountDownLatch(1);
+                CountDownLatch gate = staleGate;
+                pendingStale = daemon(() -> {
+                    awaitQuiet(gate);
+                    Lifecycle.runInGeneration(generation, LateWriteFixture::coverageEdge);
+                });
+            }
+            case MODE_RELEASE_STALE -> {
+                // Release the previously parked stale thread now that we are a fresh generation; its
+                // write must be suppressed (captured generation != active), not attributed here.
+                if (staleGate != null) {
+                    staleGate.countDown();
+                    joinQuiet(pendingStale);
+                    pendingStale = null;
+                    staleGate = null;
+                }
             }
             default -> Target.run(payload);
         }
@@ -99,10 +128,22 @@ public final class FixtureBody implements IterationBody {
         }
     }
 
-    private static void daemon(Runnable task) {
+    private static Thread daemon(Runnable task) {
         Thread t = new Thread(task, "lsp-fuzz-fixture");
         t.setDaemon(true);
         t.start();
+        return t;
+    }
+
+    private static void joinQuiet(Thread t) {
+        if (t == null) {
+            return;
+        }
+        try {
+            t.join(COORDINATION_TIMEOUT_MS);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
     }
 
     private static void awaitQuiet(CountDownLatch latch) {

@@ -1098,4 +1098,141 @@ mod tests {
             "a snapshot race must be discarded and force a restart: {race_outcome:?}"
         );
     }
+
+    /// The LS's exact pinned JDK, derived from its launcher wrapper (its FFM `SQLite` binding
+    /// segfaults on a foreign JDK build). Returns the `.../bin/java` under the jar's package root.
+    fn pinned_java_from_wrapper(ls_jar: &std::path::Path) -> Option<std::path::PathBuf> {
+        let pkg_root = ls_jar.ancestors().nth(3)?; // .../lib/<name>/<name>.jar -> package root
+        let bin = pkg_root.join("bin");
+        let wrapper = std::fs::read_dir(&bin)
+            .ok()?
+            .filter_map(Result::ok)
+            .map(|e| e.path())
+            .next()?;
+        let text = String::from_utf8_lossy(&std::fs::read(&wrapper).ok()?).into_owned();
+        for (start, _) in text.match_indices("/nix/store/") {
+            let rest = &text[start..];
+            if let Some(end) = rest.find("/bin/java") {
+                let candidate = &rest[..end + "/bin/java".len()];
+                if candidate.contains("openjdk") && !candidate.contains(['\n', '"', ' ']) {
+                    return Some(std::path::PathBuf::from(candidate));
+                }
+            }
+        }
+        None
+    }
+
+    /// Real in-process language-server lifecycle: launch the worker with the LS jar on its classpath
+    /// and `COV_ITERATION_BODY=ls`, so `cov.Worker` embeds `ls.core.ScalaLs` in-JVM over lsp4j
+    /// streams and drives a real `initialize` (once) + a per-input `hover` request. Proves two Scala
+    /// inputs run through `SubprocessTransport` + `JvmWorker` as attributable `OkSnapshot`s — real
+    /// request futures tracked, quiescence honoured, no deadlock — against the actual language
+    /// server. Gated on the LS jar (`LS_JAR`) run under its pinned JDK; skips loudly otherwise.
+    #[test]
+    fn real_in_process_ls_worker_lifecycle() {
+        let Some(ls_jar) = std::env::var_os("LS_JAR") else {
+            eprintln!("skipping real_in_process_ls_worker_lifecycle: LS_JAR unset");
+            return;
+        };
+        let ls_jar = std::path::PathBuf::from(ls_jar);
+        if !ls_jar.exists() {
+            eprintln!("skipping: LS_JAR does not exist: {}", ls_jar.display());
+            return;
+        }
+        let java = std::env::var_os("LS_JAVA")
+            .map(std::path::PathBuf::from)
+            .or_else(|| pinned_java_from_wrapper(&ls_jar))
+            .unwrap_or_else(|| std::path::PathBuf::from("java"));
+        let Some(javac) = java
+            .parent()
+            .map(|b| b.join("javac"))
+            .filter(|p| p.exists())
+        else {
+            eprintln!("skipping: no javac next to {}", java.display());
+            return;
+        };
+
+        let agent = concat!(env!("CARGO_MANIFEST_DIR"), "/../../jvm-coverage-agent/src");
+        let sources = [
+            format!("{agent}/cov/Cov.java"),
+            format!("{agent}/cov/Lifecycle.java"),
+            format!("{agent}/cov/IterationBody.java"),
+            format!("{agent}/cov/FixtureBody.java"),
+            format!("{agent}/cov/LsIterationBody.java"),
+            format!("{agent}/cov/Worker.java"),
+            format!("{agent}/fixture/Target.java"),
+            format!("{agent}/fixture/LateWriteFixture.java"),
+        ];
+        if !sources.iter().all(|s| std::path::Path::new(s).exists()) {
+            return;
+        }
+        let out = tempfile::tempdir().unwrap();
+        let compiled = Command::new(&javac)
+            .arg("-d")
+            .arg(out.path())
+            .args(&sources)
+            .status();
+        match compiled {
+            Ok(status) if status.success() => {}
+            _ => {
+                eprintln!(
+                    "skipping: agent sources did not compile with {}",
+                    javac.display()
+                );
+                return;
+            }
+        }
+
+        let map_file = out.path().join("ls-map.bin");
+        let classes_file = out.path().join("ls-classes.txt");
+        let classpath = format!("{}:{}", out.path().display(), ls_jar.display());
+        let mut command = Command::new(&java);
+        command.arg("--enable-native-access=ALL-UNNAMED");
+        // With the coverage agent attached, real language-server classes are instrumented and their
+        // reach is recorded; without it the lifecycle/attribution is still exercised (empty map).
+        let agent_jar = std::env::var_os("COV_AGENT_JAR").map(std::path::PathBuf::from);
+        let agent_attached = agent_jar.as_ref().is_some_and(|j| j.exists());
+        if let Some(jar) = agent_jar.as_ref().filter(|j| j.exists()) {
+            command.arg(format!("-javaagent:{}", jar.display()));
+            command.env("COV_CLASSES_PATH", &classes_file);
+        }
+        command
+            .arg("-cp")
+            .arg(&classpath)
+            .arg("cov.Worker")
+            .env("COV_ITERATION_BODY", "ls")
+            .env("COV_MAP_PATH", &map_file)
+            .env("COV_SETTLE_MS", "5")
+            .env("COV_LATE_WATCH_MS", "5")
+            .env("COV_QUIESCE_DEADLINE_MS", "15000");
+        let Ok(transport) = SubprocessTransport::spawn(command) else {
+            eprintln!("skipping: could not spawn the in-process LS worker");
+            return;
+        };
+        let mut worker = JvmWorker::new(transport, &map_file, Duration::from_mins(1));
+        let mut buf: Box<[u8; MAP_SIZE]> =
+            vec![0u8; MAP_SIZE].into_boxed_slice().try_into().unwrap();
+
+        // Two distinct Scala inputs: each drives a real initialize(once)/didOpen/hover cycle whose
+        // futures are tracked, so the run is an attributable clean snapshot with no stall.
+        let first = worker.run_capturing(b"object A:\n  def x: Int = 1\n", &mut buf);
+        assert!(
+            first.coverage_attributable && !first.restart_required,
+            "the first in-process LS input must be an attributable snapshot: {first:?}"
+        );
+        let second = worker.run_capturing(b"object B:\n  val y: String = \"z\"\n", &mut buf);
+        assert!(
+            second.coverage_attributable && !second.restart_required,
+            "the second in-process LS input must be an attributable snapshot: {second:?}"
+        );
+
+        if agent_attached {
+            // Coverage must have reached real language-server classes, not just transport.
+            let classes = std::fs::read_to_string(&classes_file).unwrap_or_default();
+            assert!(
+                classes.lines().any(|c| c.starts_with("ls.")),
+                "coverage should reach real ls.* classes; covered classes:\n{classes}"
+            );
+        }
+    }
 }

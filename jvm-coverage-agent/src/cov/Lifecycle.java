@@ -43,4 +43,18 @@ public final class Lifecycle {
         future.whenComplete((result, error) -> completeFuture());
         return future;
     }
+
+    /**
+     * Run background {@code task} under the generation it was scheduled in. If the task wakes after
+     * a later input has reset the map, its coverage writes are suppressed rather than misattributed
+     * (docs §6.4). Any background work that can outlive its iteration must go through this.
+     */
+    public static void runInGeneration(long generation, Runnable task) {
+        Cov.enterTaskGeneration(generation);
+        try {
+            task.run();
+        } finally {
+            Cov.exitTaskGeneration();
+        }
+    }
 }

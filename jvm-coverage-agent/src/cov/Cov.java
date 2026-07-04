@@ -39,7 +39,37 @@ public final class Cov {
     private static volatile long snapshotClosedGeneration = -1;
     private static volatile long lateWriteGeneration = -1;
 
+    // The generation a background thread was scheduled under. A thread that wakes after the map has
+    // been reset for a later input would otherwise write into the fresh map and be misattributed to
+    // that input (docs/jvm-coverage-lifecycle.md §6.4); when a task's captured generation no longer
+    // matches the active one, its writes are suppressed and its generation is flagged late instead.
+    private static final ThreadLocal<Long> TASK_GENERATION = new ThreadLocal<>();
+
     private Cov() {}
+
+    /** Run background work under a captured generation so stale writes can be detected + suppressed. */
+    public static void enterTaskGeneration(long generation) {
+        TASK_GENERATION.set(generation);
+    }
+
+    /** Clear the captured generation for the current thread. */
+    public static void exitTaskGeneration() {
+        TASK_GENERATION.remove();
+    }
+
+    /**
+     * A write from a background task whose captured generation no longer matches the active one is
+     * stale: it belongs to a finished iteration and must not touch the current map. Suppress it and
+     * flag its own generation late (so the epoch is tainted before the next accepted snapshot).
+     */
+    private static boolean staleGenerationWrite() {
+        Long captured = TASK_GENERATION.get();
+        if (captured != null && captured != activeGeneration) {
+            lateWriteGeneration = captured;
+            return true;
+        }
+        return false;
+    }
 
     /**
      * Record a transition into block {@code id}. Racy by design, exactly like AFL. Counters
@@ -48,6 +78,9 @@ public final class Cov {
      * used for quiescence, snapshot validation, and late-write detection.
      */
     public static void hit(int id) {
+        if (staleGenerationWrite()) {
+            return; // stale background write from a finished generation: never touch the live map
+        }
         int edge = (prev ^ id) & (MAP_SIZE - 1);
         int value = MAP[edge] & 0xff;
         if (value != 0xff) {
@@ -63,6 +96,9 @@ public final class Cov {
 
     /** Mark that instrumented class {@code classId} executed (one probe per class per method). */
     public static void cls(int classId) {
+        if (staleGenerationWrite()) {
+            return; // stale background class-reach from a finished generation
+        }
         COVERED_CLASSES.add(classId);
     }
 

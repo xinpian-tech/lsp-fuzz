@@ -65,6 +65,7 @@ public final class Harness {
         h.lifecycleQuiesceTimeoutGate();
         h.lifecycleSnapshotRaceGate();
         h.lifecycleLateWriteNoBleedGate();
+        h.lifecyclePostResetStaleGate();
         h.coldReplayGate();
         System.exit(h.failures == 0 ? 0 : 1);
     }
@@ -350,6 +351,29 @@ public final class Harness {
             } else {
                 fail("no-bleed gate: clean run after late write diverged from baseline: "
                         + describe(afterLate));
+            }
+        } finally {
+            w.close();
+        }
+    }
+
+    /**
+     * A background write from a finished generation that lands AFTER a later input has reset the map
+     * must be suppressed, not attributed to the later input (docs §6.4). Input N parks a stale
+     * writer; input N+1 releases it under a fresh generation; N+1's map must stay empty.
+     */
+    private void lifecyclePostResetStaleGate() throws Exception {
+        WorkerHandle w = new WorkerHandle(FAST_WINDOWS);
+        try {
+            Run stale = w.run(new byte[] {(byte) 0xE4}, 5000); // parks a writer capturing gen N
+            Run release = w.run(new byte[] {(byte) 0xE5}, 5000); // releases it under gen N+1
+            if (stale != null && stale.status == 0
+                    && release != null && release.status == 0
+                    && countNonZero(release.map) == 0) {
+                ok("post-reset stale write suppressed: released under a new generation, not attributed");
+            } else {
+                fail("post-reset stale-write gate failed: " + describe(stale) + " / "
+                        + describe(release));
             }
         } finally {
             w.close();
