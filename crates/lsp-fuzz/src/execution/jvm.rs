@@ -27,6 +27,8 @@ use std::{
 
 use libafl::executors::ExitKind;
 
+use super::outcome::{OutcomeClass, classify_outcome, classify_run};
+
 /// AFL edge-map size (2^16), matching the bytecode agent.
 pub const MAP_SIZE: usize = 1 << 16;
 
@@ -113,6 +115,78 @@ impl WorkerStatus {
     }
 }
 
+/// The worker's fine-grained outcome evidence, orthogonal to the lifecycle [`WorkerStatus`]. The
+/// status governs coverage attribution and epoch restart; the evidence names *what happened* for the
+/// oracle, letting a single `FatalJvmError` status resolve to a specific class (OOM vs stack overflow
+/// vs an uncaught exception) and letting a clean snapshot still carry a JSON-RPC error or a
+/// cancellation. Mirrors the `cov.Evidence` tags on the Java side.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutcomeEvidence {
+    /// No specific evidence; the class is derived from the status alone.
+    None,
+    /// The run completed normally.
+    NormalSuccess,
+    /// A request returned a JSON-RPC error response.
+    JsonRpcError,
+    /// A request was cancelled as expected.
+    ExpectedCancellation,
+    /// An exception escaped on a request-handling (foreground) thread.
+    ForegroundException,
+    /// An exception escaped on a background/worker thread.
+    BackgroundException,
+    /// The server logged a fatal-level event without crashing the process.
+    LoggedFatal,
+    /// A hard JVM fatal (SIGSEGV, forced exit, ...).
+    JvmFatal,
+    /// The JVM ran out of memory.
+    OutOfMemory,
+    /// The JVM overflowed the stack.
+    StackOverflow,
+    /// A run timeout / deadlock.
+    TimeoutOrDeadlock,
+    /// The control protocol desynchronized.
+    ProtocolDesync,
+}
+
+impl OutcomeEvidence {
+    fn from_tag(tag: u8) -> Option<OutcomeEvidence> {
+        Some(match tag {
+            0 => OutcomeEvidence::None,
+            1 => OutcomeEvidence::NormalSuccess,
+            2 => OutcomeEvidence::JsonRpcError,
+            3 => OutcomeEvidence::ExpectedCancellation,
+            4 => OutcomeEvidence::ForegroundException,
+            5 => OutcomeEvidence::BackgroundException,
+            6 => OutcomeEvidence::LoggedFatal,
+            7 => OutcomeEvidence::JvmFatal,
+            8 => OutcomeEvidence::OutOfMemory,
+            9 => OutcomeEvidence::StackOverflow,
+            10 => OutcomeEvidence::TimeoutOrDeadlock,
+            11 => OutcomeEvidence::ProtocolDesync,
+            _ => return None,
+        })
+    }
+
+    /// The wire tag for this evidence (inverse of [`OutcomeEvidence::from_tag`]).
+    #[must_use]
+    pub fn tag(self) -> u8 {
+        match self {
+            OutcomeEvidence::None => 0,
+            OutcomeEvidence::NormalSuccess => 1,
+            OutcomeEvidence::JsonRpcError => 2,
+            OutcomeEvidence::ExpectedCancellation => 3,
+            OutcomeEvidence::ForegroundException => 4,
+            OutcomeEvidence::BackgroundException => 5,
+            OutcomeEvidence::LoggedFatal => 6,
+            OutcomeEvidence::JvmFatal => 7,
+            OutcomeEvidence::OutOfMemory => 8,
+            OutcomeEvidence::StackOverflow => 9,
+            OutcomeEvidence::TimeoutOrDeadlock => 10,
+            OutcomeEvidence::ProtocolDesync => 11,
+        }
+    }
+}
+
 /// The worker's structured reply to a [`Request::Run`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RunResult {
@@ -125,18 +199,27 @@ pub struct RunResult {
     pub nonzero_edges: u32,
     /// Class ids reached during the run (for reach oracles); may be empty.
     pub covered_classes: Vec<u32>,
+    /// Fine-grained outcome evidence for the oracle (orthogonal to [`RunResult::status`]).
+    pub evidence: OutcomeEvidence,
+    /// A short, worker-normalized message for the evidence (e.g. an exception class); may be empty.
+    pub message: String,
 }
 
 impl RunResult {
-    /// Encode a run reply: `<status:u8><iteration_id:u64-le><nonzero_edges:u32-le><n:u32-le><class ids:u32-le...>`.
+    /// Encode a run reply:
+    /// `<status:u8><iteration_id:u64-le><nonzero_edges:u32-le><n:u32-le><class ids:u32-le...>`
+    /// `<evidence:u8><msg_len:u32-le><msg bytes>`.
     ///
     /// # Panics
     ///
-    /// Panics if more than `u32::MAX` classes were covered, which cannot happen for a `2^16` map.
+    /// Panics if more than `u32::MAX` classes were covered (impossible for a `2^16` map) or the
+    /// message is longer than `u32::MAX` bytes.
     #[must_use]
     pub fn encode(&self) -> Vec<u8> {
         let count = u32::try_from(self.covered_classes.len()).expect("class count fits in u32");
-        let mut out = Vec::with_capacity(17 + self.covered_classes.len() * 4);
+        let msg = self.message.as_bytes();
+        let msg_len = u32::try_from(msg.len()).expect("message length fits in u32");
+        let mut out = Vec::with_capacity(22 + self.covered_classes.len() * 4 + msg.len());
         out.push(self.status.tag());
         out.extend_from_slice(&self.iteration_id.to_le_bytes());
         out.extend_from_slice(&self.nonzero_edges.to_le_bytes());
@@ -144,6 +227,9 @@ impl RunResult {
         for c in &self.covered_classes {
             out.extend_from_slice(&c.to_le_bytes());
         }
+        out.push(self.evidence.tag());
+        out.extend_from_slice(&msg_len.to_le_bytes());
+        out.extend_from_slice(msg);
         out
     }
 
@@ -151,7 +237,8 @@ impl RunResult {
     ///
     /// # Errors
     ///
-    /// Returns [`WorkerError::Protocol`] if the bytes are truncated or carry an unknown status tag.
+    /// Returns [`WorkerError::Protocol`] if the bytes are truncated or carry an unknown status or
+    /// evidence tag.
     pub fn decode(bytes: &[u8]) -> Result<RunResult, WorkerError> {
         let mut cursor = bytes;
         let mut u8v = || -> Result<u8, WorkerError> {
@@ -191,6 +278,16 @@ impl RunResult {
                     .map_err(|_| WorkerError::Protocol)?,
             ));
         }
+        let evidence =
+            OutcomeEvidence::from_tag(*take(&mut cursor, 1)?.first().ok_or(WorkerError::Protocol)?)
+                .ok_or(WorkerError::Protocol)?;
+        let msg_len = u32::from_le_bytes(
+            take(&mut cursor, 4)?
+                .try_into()
+                .map_err(|_| WorkerError::Protocol)?,
+        ) as usize;
+        let message =
+            String::from_utf8(take(&mut cursor, msg_len)?).map_err(|_| WorkerError::Protocol)?;
         // Fail closed on a reply that is longer than the declared payload.
         if !cursor.is_empty() {
             return Err(WorkerError::Protocol);
@@ -200,6 +297,8 @@ impl RunResult {
             iteration_id,
             nonzero_edges,
             covered_classes,
+            evidence,
+            message,
         })
     }
 }
@@ -262,6 +361,9 @@ pub struct LifecycleOutcome {
     pub restart_required: bool,
     /// Whether the run was flagged unstable (e.g. a late write): recorded for feedback down-weighting.
     pub instability: bool,
+    /// The oracle's classification of this run. [`decide`] fills it from the status alone
+    /// (evidence-`None`); [`JvmWorker::run`] refines it with the reply's outcome evidence.
+    pub outcome_class: OutcomeClass,
 }
 
 /// Map a worker run status to the driver's lifecycle decision.
@@ -271,12 +373,14 @@ pub struct LifecycleOutcome {
 /// input's map.
 #[must_use]
 pub fn decide(status: WorkerStatus) -> LifecycleOutcome {
+    let outcome_class = classify_run(status);
     match status {
         WorkerStatus::OkSnapshot => LifecycleOutcome {
             exit_kind: ExitKind::Ok,
             coverage_attributable: true,
             restart_required: false,
             instability: false,
+            outcome_class,
         },
         // A stalled run, a stalled quiescence, and a desynced protocol are all "no attributable
         // result, restart the epoch" — the executor treats them as a timeout-class execution.
@@ -287,18 +391,21 @@ pub fn decide(status: WorkerStatus) -> LifecycleOutcome {
             coverage_attributable: false,
             restart_required: true,
             instability: false,
+            outcome_class,
         },
         WorkerStatus::LateCoverage | WorkerStatus::SnapshotRace => LifecycleOutcome {
             exit_kind: ExitKind::Ok,
             coverage_attributable: false,
             restart_required: true,
             instability: true,
+            outcome_class,
         },
         WorkerStatus::FatalJvmError => LifecycleOutcome {
             exit_kind: ExitKind::Crash,
             coverage_attributable: false,
             restart_required: true,
             instability: false,
+            outcome_class,
         },
     }
 }
@@ -366,7 +473,13 @@ impl<T: WorkerTransport + std::fmt::Debug> JvmWorker<T> {
             .request(&Request::Run(input.to_vec()), self.run_deadline)
             .and_then(|reply| RunResult::decode(&reply))
         {
-            Ok(result) => decide(result.status),
+            Ok(result) => {
+                // Attribution/restart come from the lifecycle status; refine the oracle class with
+                // the reply's fine-grained evidence.
+                let mut outcome = decide(result.status);
+                outcome.outcome_class = classify_outcome(result.status, result.evidence);
+                outcome
+            }
             Err(WorkerError::Timeout) => decide(WorkerStatus::TimeoutRun),
             Err(_) => decide(WorkerStatus::ProtocolError),
         }
@@ -628,6 +741,8 @@ mod tests {
             iteration_id: 42,
             nonzero_edges: 931,
             covered_classes: vec![1, 1000, 3662],
+            evidence: OutcomeEvidence::ForegroundException,
+            message: "java.lang.NullPointerException".to_string(),
         };
         let decoded = RunResult::decode(&original.encode()).unwrap();
         assert_eq!(decoded, original);
@@ -643,6 +758,38 @@ mod tests {
         // valid status tag but truncated body
         assert!(matches!(
             RunResult::decode(&[0, 1, 2]),
+            Err(WorkerError::Protocol)
+        ));
+    }
+
+    #[test]
+    fn decode_rejects_unknown_evidence_tag() {
+        // A well-formed reply body through the class ids, then an unknown evidence tag (99).
+        let mut wire = Vec::new();
+        wire.push(WorkerStatus::OkSnapshot.tag());
+        wire.extend_from_slice(&0u64.to_le_bytes()); // iteration_id
+        wire.extend_from_slice(&0u32.to_le_bytes()); // nonzero_edges
+        wire.extend_from_slice(&0u32.to_le_bytes()); // class count
+        wire.push(99); // unknown evidence tag
+        wire.extend_from_slice(&0u32.to_le_bytes()); // msg len 0
+        assert!(matches!(
+            RunResult::decode(&wire),
+            Err(WorkerError::Protocol)
+        ));
+    }
+
+    #[test]
+    fn decode_rejects_message_length_overrun() {
+        // Declares a 4-byte message but supplies none.
+        let mut wire = Vec::new();
+        wire.push(WorkerStatus::OkSnapshot.tag());
+        wire.extend_from_slice(&0u64.to_le_bytes());
+        wire.extend_from_slice(&0u32.to_le_bytes());
+        wire.extend_from_slice(&0u32.to_le_bytes());
+        wire.push(OutcomeEvidence::NormalSuccess.tag());
+        wire.extend_from_slice(&4u32.to_le_bytes()); // claims 4 message bytes, none follow
+        assert!(matches!(
+            RunResult::decode(&wire),
             Err(WorkerError::Protocol)
         ));
     }
@@ -687,6 +834,8 @@ mod tests {
             iteration_id: 7,
             nonzero_edges: 0,
             covered_classes: vec![],
+            evidence: OutcomeEvidence::None,
+            message: String::new(),
         };
         let decoded = RunResult::decode(&reply.encode()).unwrap();
         assert_eq!(decoded.status, WorkerStatus::TimeoutRun);
@@ -707,6 +856,8 @@ mod tests {
             iteration_id: 1,
             nonzero_edges: 10,
             covered_classes: vec![],
+            evidence: OutcomeEvidence::None,
+            message: String::new(),
         }
         .encode();
         let mut worker = JvmWorker::new(
@@ -726,6 +877,8 @@ mod tests {
             iteration_id: 7,
             nonzero_edges: 5,
             covered_classes: vec![],
+            evidence: OutcomeEvidence::None,
+            message: String::new(),
         }
         .encode();
         let mut worker = JvmWorker::new(
@@ -737,6 +890,54 @@ mod tests {
         assert!(!outcome.coverage_attributable);
         assert!(outcome.restart_required);
         assert!(outcome.instability);
+    }
+
+    #[test]
+    fn run_refines_outcome_class_from_evidence() {
+        use crate::execution::outcome::OutcomeClass;
+
+        // A fatal JVM error carrying OOM evidence classifies as OOM/StackOverflow, not generic fatal.
+        let oom = RunResult {
+            status: WorkerStatus::FatalJvmError,
+            iteration_id: 1,
+            nonzero_edges: 0,
+            covered_classes: vec![],
+            evidence: OutcomeEvidence::OutOfMemory,
+            message: "java.lang.OutOfMemoryError".to_string(),
+        }
+        .encode();
+        let mut worker = JvmWorker::new(
+            MockTransport::new(vec![Ok(oom)]),
+            "/nonexistent/map",
+            Duration::from_secs(1),
+        );
+        let outcome = worker.run(b"input");
+        assert_eq!(outcome.exit_kind, ExitKind::Crash);
+        assert_eq!(
+            outcome.outcome_class,
+            OutcomeClass::OutOfMemoryOrStackOverflow
+        );
+
+        // A clean snapshot carrying JSON-RPC-error evidence stays Ok/attributable but classifies as
+        // a JSON-RPC error (a finding).
+        let err = RunResult {
+            status: WorkerStatus::OkSnapshot,
+            iteration_id: 2,
+            nonzero_edges: 10,
+            covered_classes: vec![],
+            evidence: OutcomeEvidence::JsonRpcError,
+            message: "method not found".to_string(),
+        }
+        .encode();
+        let mut worker = JvmWorker::new(
+            MockTransport::new(vec![Ok(err)]),
+            "/nonexistent/map",
+            Duration::from_secs(1),
+        );
+        let outcome = worker.run(b"input");
+        assert!(outcome.coverage_attributable);
+        assert_eq!(outcome.outcome_class, OutcomeClass::JsonRpcError);
+        assert!(outcome.outcome_class.is_finding());
     }
 
     #[test]
@@ -800,6 +1001,8 @@ mod tests {
             iteration_id: 1,
             nonzero_edges: 0,
             covered_classes: vec![],
+            evidence: OutcomeEvidence::None,
+            message: String::new(),
         }
         .encode();
         wire.push(0xAB); // one byte past the declared payload
@@ -885,6 +1088,8 @@ mod tests {
             iteration_id: 1,
             nonzero_edges: u32::try_from(MAP_SIZE).unwrap(),
             covered_classes: vec![],
+            evidence: OutcomeEvidence::None,
+            message: String::new(),
         }
         .encode();
         let late = RunResult {
@@ -892,6 +1097,8 @@ mod tests {
             iteration_id: 2,
             nonzero_edges: 3,
             covered_classes: vec![],
+            evidence: OutcomeEvidence::None,
+            message: String::new(),
         }
         .encode();
         let mut worker = JvmWorker::new(
@@ -929,6 +1136,8 @@ mod tests {
             iteration_id: 1,
             nonzero_edges: 5,
             covered_classes: vec![],
+            evidence: OutcomeEvidence::None,
+            message: String::new(),
         }
         .encode();
         let mut worker = JvmWorker::new(
@@ -962,6 +1171,9 @@ mod tests {
         let sources = [
             format!("{agent}/cov/Cov.java"),
             format!("{agent}/cov/Lifecycle.java"),
+            format!("{agent}/cov/Evidence.java"),
+            format!("{agent}/cov/RunOutcome.java"),
+            format!("{agent}/cov/Findings.java"),
             format!("{agent}/cov/IterationBody.java"),
             format!("{agent}/cov/FixtureBody.java"),
             format!("{agent}/cov/LsIterationBody.java"),
@@ -1015,6 +1227,89 @@ mod tests {
         // Dropping the worker/transport reaps the child.
     }
 
+    /// End-to-end outcome-oracle check on the real Java worker: drive the planted fixture modes for
+    /// each outcome class through the real subprocess transport and assert the worker's evidence maps
+    /// to the exact [`OutcomeClass`]. Also proves the JVM-path JSON-RPC finding side channel
+    /// (`$COV_FINDINGS_PATH`) is read into a deduplicated finding set. Skips if the JDK is absent.
+    #[test]
+    fn outcome_evidence_classification_matrix() {
+        use crate::execution::outcome::OutcomeClass;
+        use crate::findings::findings_from_jvm_side_channel;
+
+        let agent = concat!(env!("CARGO_MANIFEST_DIR"), "/../../jvm-coverage-agent/src");
+        let sources = [
+            format!("{agent}/cov/Cov.java"),
+            format!("{agent}/cov/Lifecycle.java"),
+            format!("{agent}/cov/Evidence.java"),
+            format!("{agent}/cov/RunOutcome.java"),
+            format!("{agent}/cov/Findings.java"),
+            format!("{agent}/cov/IterationBody.java"),
+            format!("{agent}/cov/FixtureBody.java"),
+            format!("{agent}/cov/LsIterationBody.java"),
+            format!("{agent}/cov/RunBudgetExceededException.java"),
+            format!("{agent}/cov/Worker.java"),
+            format!("{agent}/fixture/Target.java"),
+            format!("{agent}/fixture/LateWriteFixture.java"),
+        ];
+        assert_sources_present(&sources);
+        let out = tempfile::tempdir().unwrap();
+        let compiled = Command::new("javac")
+            .arg("-d")
+            .arg(out.path())
+            .args(&sources)
+            .status();
+        match compiled {
+            Ok(status) if status.success() => {}
+            Ok(_) => panic!("javac is present but the agent sources failed to compile"),
+            Err(_) => return, // javac unavailable: skip
+        }
+
+        let map_file = out.path().join("map.bin");
+        let findings_file = out.path().join("findings.tsv");
+        let mut command = Command::new("java");
+        command
+            .arg("-cp")
+            .arg(out.path())
+            .arg("cov.Worker")
+            .env("COV_MAP_PATH", &map_file)
+            .env("COV_FINDINGS_PATH", &findings_file)
+            .env("COV_SETTLE_MS", "1")
+            .env("COV_LATE_WATCH_MS", "1")
+            .env("COV_QUIESCE_DEADLINE_MS", "2000");
+        let Ok(transport) = SubprocessTransport::spawn(command) else {
+            return;
+        };
+        let mut worker = JvmWorker::new(transport, &map_file, Duration::from_secs(30));
+
+        // (planted mode byte, expected outcome class). The fixture maps each mode to a distinct
+        // Evidence tag / thrown error; the worker serializes it and the Rust driver classifies it.
+        let matrix: &[(u8, OutcomeClass)] = &[
+            (0x01, OutcomeClass::NormalSuccess),
+            (0xE7, OutcomeClass::OutOfMemoryOrStackOverflow),
+            (0xE8, OutcomeClass::OutOfMemoryOrStackOverflow),
+            (0xE9, OutcomeClass::ForegroundException),
+            (0xEA, OutcomeClass::BackgroundException),
+            (0xEB, OutcomeClass::LoggedFatal),
+            (0xEC, OutcomeClass::JsonRpcError),
+            (0xED, OutcomeClass::ExpectedCancellation),
+        ];
+        for (mode, expected) in matrix {
+            let outcome = worker.run(&[*mode]);
+            assert_eq!(
+                outcome.outcome_class, *expected,
+                "planted mode {mode:#x} should classify as {expected:?}, got {outcome:?}"
+            );
+        }
+
+        // The JSON-RPC-error mode wrote a finding to the side channel; it parses into one finding.
+        let contents = std::fs::read_to_string(&findings_file)
+            .expect("the JSON-RPC-error mode must publish a findings file");
+        let set = findings_from_jvm_side_channel(&contents);
+        assert_eq!(set.len(), 1, "one JSON-RPC finding expected, got {set:?}");
+        assert_eq!(set.as_slice()[0].class, OutcomeClass::JsonRpcError);
+        assert_eq!(set.as_slice()[0].error_code, Some(-32603));
+    }
+
     /// End-to-end coverage-lifecycle check on the real Java worker (no coverage agent needed — the
     /// planted fixture records its edge directly). Drives the real subprocess transport and proves
     /// the attribution contract: a clean input is attributable; a planted late write and a planted
@@ -1027,6 +1322,9 @@ mod tests {
         let sources = [
             format!("{agent}/cov/Cov.java"),
             format!("{agent}/cov/Lifecycle.java"),
+            format!("{agent}/cov/Evidence.java"),
+            format!("{agent}/cov/RunOutcome.java"),
+            format!("{agent}/cov/Findings.java"),
             format!("{agent}/cov/IterationBody.java"),
             format!("{agent}/cov/FixtureBody.java"),
             format!("{agent}/cov/LsIterationBody.java"),
@@ -1200,6 +1498,9 @@ mod tests {
         let sources = [
             format!("{agent}/cov/Cov.java"),
             format!("{agent}/cov/Lifecycle.java"),
+            format!("{agent}/cov/Evidence.java"),
+            format!("{agent}/cov/RunOutcome.java"),
+            format!("{agent}/cov/Findings.java"),
             format!("{agent}/cov/IterationBody.java"),
             format!("{agent}/cov/FixtureBody.java"),
             format!("{agent}/cov/LsIterationBody.java"),

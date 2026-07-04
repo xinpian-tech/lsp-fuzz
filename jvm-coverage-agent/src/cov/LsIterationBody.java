@@ -46,6 +46,11 @@ public final class LsIterationBody implements IterationBody {
     // Request methods forwarded and completed during the current input, published to
     // $COV_REQUESTS_PATH so a test can prove the exact stored requests actually executed.
     private final List<String> completedRequests = new ArrayList<>();
+    // JSON-RPC error responses observed this input, published to $COV_FINDINGS_PATH for the oracle.
+    private final Findings findings = new Findings();
+    // Fine-grained evidence for a clean run: normal success unless a request errored or was cancelled.
+    private int evidenceTag = Evidence.NORMAL_SUCCESS;
+    private String evidenceMessage = "";
 
     // Cached reflection handles.
     private Method endpointRequest; // Endpoint.request(String, Object) -> CompletableFuture
@@ -61,6 +66,9 @@ public final class LsIterationBody implements IterationBody {
         ensureStarted();
         Envelope env = Envelope.parse(payload);
         completedRequests.clear();
+        findings.reset();
+        evidenceTag = Evidence.NORMAL_SUCCESS;
+        evidenceMessage = "";
         allowedMethods = env.allowedMethods;
         // The profile's per-input run budget (COV_RUN_TIMEOUT_MS) bounds initialize + every replayed
         // request; when it expires we throw, so the worker returns a non-attributable status and the
@@ -84,6 +92,7 @@ public final class LsIterationBody implements IterationBody {
                 dispatch(new String(frame, StandardCharsets.UTF_8), deadlineNanos);
             }
             publishCompletedRequests();
+            findings.publish();
         } catch (RuntimeException e) {
             throw e;
         } catch (Exception e) {
@@ -142,9 +151,72 @@ public final class LsIterationBody implements IterationBody {
 
     private void requestAndWait(String method, Object params, long deadlineNanos) throws Exception {
         Object future = endpointRequest.invoke(endpoint, method, params);
-        awaitWithinBudget(Lifecycle.track((CompletableFuture<?>) future), deadlineNanos);
-        // Record only after the future resolves, so the side channel lists completed requests.
-        completedRequests.add(method);
+        CompletableFuture<?> tracked = Lifecycle.track((CompletableFuture<?>) future);
+        try {
+            awaitWithinBudget(tracked, deadlineNanos);
+            // Record only after the future resolves, so the side channel lists completed requests.
+            completedRequests.add(method);
+        } catch (java.util.concurrent.ExecutionException ee) {
+            Throwable cause = ee.getCause();
+            if (isResponseError(cause)) {
+                // A JSON-RPC error response is a finding, not a fatal run: record it and continue so
+                // the rest of the input still executes.
+                recordJsonRpcError(method, cause);
+            } else {
+                throw ee; // a genuine failure → uncaught foreground exception
+            }
+        } catch (java.util.concurrent.CancellationException ce) {
+            // An expected cancellation (e.g. a $/cancelRequest was honoured): not a finding.
+            evidenceTag = Evidence.EXPECTED_CANCELLATION;
+            evidenceMessage = method;
+        }
+    }
+
+    /** Whether {@code cause} is an lsp4j {@code ResponseErrorException} (a JSON-RPC error response). */
+    private static boolean isResponseError(Throwable cause) {
+        if (cause == null) {
+            return false;
+        }
+        try {
+            Class<?> ree = Class.forName("org.eclipse.lsp4j.jsonrpc.ResponseErrorException");
+            return ree.isInstance(cause);
+        } catch (ClassNotFoundException e) {
+            return false;
+        }
+    }
+
+    /** Extract the JSON-RPC error's code + message from an lsp4j {@code ResponseErrorException}. */
+    private void recordJsonRpcError(String method, Throwable cause) {
+        long code = 0;
+        String message = cause.getMessage();
+        try {
+            Object error = cause.getClass().getMethod("getResponseError").invoke(cause);
+            if (error != null) {
+                Object c = error.getClass().getMethod("getCode").invoke(error);
+                if (c instanceof Number n) {
+                    code = n.longValue();
+                }
+                Object m = error.getClass().getMethod("getMessage").invoke(error);
+                if (m != null) {
+                    message = m.toString();
+                }
+            }
+        } catch (ReflectiveOperationException e) {
+            // Fall back to the exception message + a zero code if the shape is unexpected.
+        }
+        findings.recordJsonRpcError(method, code, message);
+        evidenceTag = Evidence.JSON_RPC_ERROR;
+        evidenceMessage = method;
+    }
+
+    @Override
+    public int evidenceTag() {
+        return evidenceTag;
+    }
+
+    @Override
+    public String evidenceMessage() {
+        return evidenceMessage;
     }
 
     /**

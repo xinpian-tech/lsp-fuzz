@@ -24,7 +24,8 @@ import java.util.stream.Stream;
  *            | 'S'                                  status
  *            | 'Q'                                  quit
  *   reply    : u32le(len) body[len]                every non-quit reply is length-prefixed
- *     run body    : u8 status, u64le iterationId, u32le nonzeroEdges, u32le nClasses, u32le[] ids
+ *     run body    : u8 status, u64le iterationId, u32le nonzeroEdges, u32le nClasses, u32le[] ids,
+ *                   u8 evidence, u32le msgLen, msg[msgLen]     (fine-grained oracle evidence)
  *     status body : u64le usedHeap, u32le threads, u64le openFds        (exactly 20 bytes)
  * </pre>
  *
@@ -71,17 +72,17 @@ public final class Worker {
                     int len = readU32Le(in);
                     byte[] payload = in.readNBytes(len);
                     iterationId++;
-                    int status;
+                    RunOutcome outcome;
                     if (acceptedGeneration >= 0
                             && (Cov.hadLateWrite(acceptedGeneration)
                                     || Cov.writes() != acceptedWrites)) {
                         // A background thread from the previous input wrote after we accepted its
                         // snapshot. Refuse to run this input on a contaminated epoch; the driver
                         // discards and restarts (docs §6.4).
-                        status = STATUS_LATE_COVERAGE;
+                        outcome = RunOutcome.of(STATUS_LATE_COVERAGE);
                     } else {
-                        status = runIteration(body, payload, iterationId);
-                        if (status == STATUS_OK_SNAPSHOT) {
+                        outcome = runIteration(body, payload, iterationId);
+                        if (outcome.status == STATUS_OK_SNAPSHOT) {
                             acceptedGeneration = iterationId;
                             acceptedWrites = Cov.writes();
                         } else {
@@ -89,11 +90,16 @@ public final class Worker {
                             acceptedWrites = -1;
                         }
                     }
-                    ByteBuffer replyBody = ByteBuffer.allocate(17).order(ByteOrder.LITTLE_ENDIAN);
-                    replyBody.put((byte) status);
+                    byte[] msg = outcome.message.getBytes(java.nio.charset.StandardCharsets.UTF_8);
+                    ByteBuffer replyBody =
+                            ByteBuffer.allocate(22 + msg.length).order(ByteOrder.LITTLE_ENDIAN);
+                    replyBody.put((byte) outcome.status);
                     replyBody.putLong(iterationId);
                     replyBody.putInt(Cov.nonZeroEdges());
                     replyBody.putInt(0); // covered-class ids travel via $COV_CLASSES_PATH
+                    replyBody.put((byte) outcome.evidence);
+                    replyBody.putInt(msg.length);
+                    replyBody.put(msg);
                     writeFrame(out, replyBody.array());
                 }
                 case 'S' -> {
@@ -127,7 +133,7 @@ public final class Worker {
     }
 
     /** Drive one input through reset → run → quiesce → snapshot → late-watch and classify it. */
-    private static int runIteration(IterationBody body, byte[] payload, long generation) {
+    private static RunOutcome runIteration(IterationBody body, byte[] payload, long generation) {
         Lifecycle.reset();
         Cov.reset(generation);
         try {
@@ -135,14 +141,27 @@ public final class Worker {
         } catch (RunBudgetExceededException t) {
             // An ordinary run timeout: non-attributable + restart, but NOT a crash objective.
             Cov.dump();
-            return STATUS_TIMEOUT_RUN;
+            return new RunOutcome(STATUS_TIMEOUT_RUN, Evidence.TIMEOUT_OR_DEADLOCK, t.getMessage());
+        } catch (OutOfMemoryError t) {
+            Cov.dump();
+            return new RunOutcome(STATUS_FATAL_JVM_ERROR, Evidence.OUT_OF_MEMORY, throwableName(t));
+        } catch (StackOverflowError t) {
+            Cov.dump();
+            return new RunOutcome(
+                    STATUS_FATAL_JVM_ERROR, Evidence.STACK_OVERFLOW, throwableName(t));
         } catch (Throwable t) {
             Cov.dump();
-            return STATUS_FATAL_JVM_ERROR;
+            // A body may have flagged more specific evidence (e.g. a background exception) before the
+            // throwable unwound; otherwise this is an uncaught foreground exception.
+            int evidence = body.evidenceTag();
+            if (evidence == Evidence.NORMAL_SUCCESS || evidence == Evidence.NONE) {
+                evidence = Evidence.FOREGROUND_EXCEPTION;
+            }
+            return new RunOutcome(STATUS_FATAL_JVM_ERROR, evidence, throwableName(t));
         }
         if (!quiesce()) {
             Cov.dump();
-            return STATUS_TIMEOUT_QUIESCENCE;
+            return RunOutcome.of(STATUS_TIMEOUT_QUIESCENCE);
         }
         // Snapshot with double validation: the map must not change while the driver copies it.
         long writesBefore = Cov.writes();
@@ -154,16 +173,22 @@ public final class Worker {
         if (Cov.currentGeneration() != generation
                 || digestBefore != digestAfter
                 || writesBefore != writesAfter) {
-            return STATUS_SNAPSHOT_RACE;
+            return RunOutcome.of(STATUS_SNAPSHOT_RACE);
         }
         // Late-watch: any write under this generation after the snapshot closes taints the epoch.
         Cov.markSnapshotClosed(generation);
         body.onLateWatchBegin();
         sleepQuiet(LATE_WATCH_MS);
         if (Cov.hadLateWrite(generation)) {
-            return STATUS_LATE_COVERAGE;
+            return RunOutcome.of(STATUS_LATE_COVERAGE);
         }
-        return STATUS_OK_SNAPSHOT;
+        // A clean snapshot: the body names the fine-grained evidence (normal success by default, or a
+        // JSON-RPC error / expected cancellation / background exception / logged fatal it observed).
+        return new RunOutcome(STATUS_OK_SNAPSHOT, body.evidenceTag(), body.evidenceMessage());
+    }
+
+    private static String throwableName(Throwable t) {
+        return t.getClass().getName();
     }
 
     /**

@@ -39,6 +39,9 @@ fn jvm_mode_fuzz_smoke_reaches_loop_without_deadlock() {
     let sources = [
         format!("{agent}/cov/Cov.java"),
         format!("{agent}/cov/Lifecycle.java"),
+        format!("{agent}/cov/Evidence.java"),
+        format!("{agent}/cov/RunOutcome.java"),
+        format!("{agent}/cov/Findings.java"),
         format!("{agent}/cov/IterationBody.java"),
         format!("{agent}/cov/FixtureBody.java"),
         format!("{agent}/cov/LsIterationBody.java"),

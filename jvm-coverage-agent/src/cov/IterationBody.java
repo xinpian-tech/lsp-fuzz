@@ -16,4 +16,19 @@ public interface IterationBody {
 
     /** Called after the snapshot is accepted, at the start of the late-write watch window. */
     default void onLateWatchBegin() {}
+
+    /**
+     * The fine-grained {@link Evidence} tag for the run that just completed (a clean run that
+     * returned normally). Defaults to {@link Evidence#NORMAL_SUCCESS}; a body overrides it to report
+     * a JSON-RPC error, an expected cancellation, a background exception, or a logged fatal that did
+     * not throw out of {@link #run}.
+     */
+    default int evidenceTag() {
+        return Evidence.NORMAL_SUCCESS;
+    }
+
+    /** A short normalized message for {@link #evidenceTag}; may be empty. */
+    default String evidenceMessage() {
+        return "";
+    }
 }

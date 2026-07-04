@@ -4,14 +4,15 @@
 //! [`OutcomeClass`]. The classes cover the full space the oracle needs to reason about — from a
 //! plain successful response through the various ways the server can misbehave (a JSON-RPC error, an
 //! uncaught exception on a foreground or background thread, a logged fatal, a hard JVM fatal, memory
-//! exhaustion, a hang, or a protocol desync). Only a subset of these are observable from the
-//! worker's coverage-lifecycle status alone; the rest require richer evidence that the worker does
-//! not yet report, so [`classify_run`] maps what the worker *can* observe today and the remaining
-//! classes are populated from other signals (e.g. JSON-RPC error responses on the native path).
+//! exhaustion, a hang, or a protocol desync). [`classify_outcome`] resolves a run from the worker's
+//! lifecycle status **and** its fine-grained outcome evidence: the status is authoritative for the
+//! attribution-driven classes (timeout, instability, protocol desync) while the evidence names the
+//! specific class for a clean snapshot or a fatal error. [`classify_run`] is the evidence-`None`
+//! shorthand for callers that have only a status (a transport or copy-out failure).
 
 use serde::{Deserialize, Serialize};
 
-use super::jvm::WorkerStatus;
+use super::jvm::{OutcomeEvidence, WorkerStatus};
 
 /// The classification of a single iteration's outcome.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -64,22 +65,52 @@ impl OutcomeClass {
     }
 }
 
-/// Classify a run from the worker's coverage-lifecycle status.
-///
-/// This only covers what the worker reports today. `FatalJvmError` folds every hard failure into
-/// [`OutcomeClass::JvmFatal`] until the worker carries the richer evidence needed to distinguish
-/// OOM / stack overflow / foreground / background / logged-fatal sub-classes; the JSON-RPC error and
-/// cancellation classes come from response matching, not from the worker status.
+/// Classify a run from the worker's coverage-lifecycle status alone (evidence unknown). A shorthand
+/// for [`classify_outcome`] with [`OutcomeEvidence::None`], used where only the status is available
+/// (a transport failure, a copy-out failure).
 #[must_use]
 pub const fn classify_run(status: WorkerStatus) -> OutcomeClass {
+    classify_outcome(status, OutcomeEvidence::None)
+}
+
+/// Classify a run from the worker's lifecycle status **and** its fine-grained outcome evidence.
+///
+/// The status is authoritative for the attribution-driven classes: any timeout is
+/// [`OutcomeClass::TimeoutOrDeadlock`], a late/racy snapshot is [`OutcomeClass::Instability`], and a
+/// protocol error is [`OutcomeClass::ProtocolDesync`] — the evidence cannot override these. For a
+/// clean snapshot or a fatal JVM error, the evidence names the specific class (so a `FatalJvmError`
+/// resolves to OOM / stack overflow / foreground / background / logged-fatal / hard fatal, and a
+/// clean snapshot can still carry a JSON-RPC error or an expected cancellation). Evidence-`None` on a
+/// `FatalJvmError` is a generic [`OutcomeClass::JvmFatal`]; on a clean snapshot it is a plain success.
+#[must_use]
+pub const fn classify_outcome(status: WorkerStatus, evidence: OutcomeEvidence) -> OutcomeClass {
     match status {
-        WorkerStatus::OkSnapshot => OutcomeClass::NormalSuccess,
         WorkerStatus::TimeoutRun | WorkerStatus::TimeoutQuiescence => {
-            OutcomeClass::TimeoutOrDeadlock
+            return OutcomeClass::TimeoutOrDeadlock;
         }
-        WorkerStatus::FatalJvmError => OutcomeClass::JvmFatal,
-        WorkerStatus::ProtocolError => OutcomeClass::ProtocolDesync,
-        WorkerStatus::LateCoverage | WorkerStatus::SnapshotRace => OutcomeClass::Instability,
+        WorkerStatus::LateCoverage | WorkerStatus::SnapshotRace => {
+            return OutcomeClass::Instability;
+        }
+        WorkerStatus::ProtocolError => return OutcomeClass::ProtocolDesync,
+        WorkerStatus::OkSnapshot | WorkerStatus::FatalJvmError => {}
+    }
+    match evidence {
+        OutcomeEvidence::None => match status {
+            WorkerStatus::FatalJvmError => OutcomeClass::JvmFatal,
+            _ => OutcomeClass::NormalSuccess,
+        },
+        OutcomeEvidence::NormalSuccess => OutcomeClass::NormalSuccess,
+        OutcomeEvidence::JsonRpcError => OutcomeClass::JsonRpcError,
+        OutcomeEvidence::ExpectedCancellation => OutcomeClass::ExpectedCancellation,
+        OutcomeEvidence::ForegroundException => OutcomeClass::ForegroundException,
+        OutcomeEvidence::BackgroundException => OutcomeClass::BackgroundException,
+        OutcomeEvidence::LoggedFatal => OutcomeClass::LoggedFatal,
+        OutcomeEvidence::JvmFatal => OutcomeClass::JvmFatal,
+        OutcomeEvidence::OutOfMemory | OutcomeEvidence::StackOverflow => {
+            OutcomeClass::OutOfMemoryOrStackOverflow
+        }
+        OutcomeEvidence::TimeoutOrDeadlock => OutcomeClass::TimeoutOrDeadlock,
+        OutcomeEvidence::ProtocolDesync => OutcomeClass::ProtocolDesync,
     }
 }
 
@@ -116,6 +147,84 @@ mod tests {
         assert_eq!(
             classify_run(WorkerStatus::SnapshotRace),
             OutcomeClass::Instability
+        );
+    }
+
+    #[test]
+    fn classify_outcome_combines_status_and_evidence() {
+        use OutcomeEvidence as Ev;
+        use WorkerStatus as St;
+
+        // Status-authoritative classes ignore the evidence.
+        for ev in [Ev::None, Ev::NormalSuccess, Ev::JsonRpcError, Ev::JvmFatal] {
+            assert_eq!(
+                classify_outcome(St::TimeoutRun, ev),
+                OutcomeClass::TimeoutOrDeadlock
+            );
+            assert_eq!(
+                classify_outcome(St::TimeoutQuiescence, ev),
+                OutcomeClass::TimeoutOrDeadlock
+            );
+            assert_eq!(
+                classify_outcome(St::LateCoverage, ev),
+                OutcomeClass::Instability
+            );
+            assert_eq!(
+                classify_outcome(St::SnapshotRace, ev),
+                OutcomeClass::Instability
+            );
+            assert_eq!(
+                classify_outcome(St::ProtocolError, ev),
+                OutcomeClass::ProtocolDesync
+            );
+        }
+
+        // A clean snapshot: evidence names the class.
+        assert_eq!(
+            classify_outcome(St::OkSnapshot, Ev::None),
+            OutcomeClass::NormalSuccess
+        );
+        assert_eq!(
+            classify_outcome(St::OkSnapshot, Ev::NormalSuccess),
+            OutcomeClass::NormalSuccess
+        );
+        assert_eq!(
+            classify_outcome(St::OkSnapshot, Ev::JsonRpcError),
+            OutcomeClass::JsonRpcError
+        );
+        assert_eq!(
+            classify_outcome(St::OkSnapshot, Ev::ExpectedCancellation),
+            OutcomeClass::ExpectedCancellation
+        );
+        assert_eq!(
+            classify_outcome(St::OkSnapshot, Ev::BackgroundException),
+            OutcomeClass::BackgroundException
+        );
+        assert_eq!(
+            classify_outcome(St::OkSnapshot, Ev::LoggedFatal),
+            OutcomeClass::LoggedFatal
+        );
+
+        // A fatal JVM error: evidence splits the fatal sub-classes.
+        assert_eq!(
+            classify_outcome(St::FatalJvmError, Ev::None),
+            OutcomeClass::JvmFatal
+        );
+        assert_eq!(
+            classify_outcome(St::FatalJvmError, Ev::JvmFatal),
+            OutcomeClass::JvmFatal
+        );
+        assert_eq!(
+            classify_outcome(St::FatalJvmError, Ev::OutOfMemory),
+            OutcomeClass::OutOfMemoryOrStackOverflow
+        );
+        assert_eq!(
+            classify_outcome(St::FatalJvmError, Ev::StackOverflow),
+            OutcomeClass::OutOfMemoryOrStackOverflow
+        );
+        assert_eq!(
+            classify_outcome(St::FatalJvmError, Ev::ForegroundException),
+            OutcomeClass::ForegroundException
         );
     }
 

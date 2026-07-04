@@ -24,6 +24,14 @@ public final class FixtureBody implements IterationBody {
     private static final int MODE_POST_RESET_STALE = 0xE4;
     private static final int MODE_RELEASE_STALE = 0xE5;
     private static final int MODE_RUN_BUDGET_TIMEOUT = 0xE6;
+    // Planted outcome-oracle classes: each maps to a specific Evidence tag or thrown error.
+    private static final int MODE_OUT_OF_MEMORY = 0xE7;
+    private static final int MODE_STACK_OVERFLOW = 0xE8;
+    private static final int MODE_FOREGROUND_EXCEPTION = 0xE9;
+    private static final int MODE_BACKGROUND_EXCEPTION = 0xEA;
+    private static final int MODE_LOGGED_FATAL = 0xEB;
+    private static final int MODE_JSON_RPC_ERROR = 0xEC;
+    private static final int MODE_EXPECTED_CANCELLATION = 0xED;
 
     private static final long BACKGROUND_DELAY_MS = 30;
     private static final long NEVER_COMPLETES_MS = 60_000;
@@ -39,6 +47,10 @@ public final class FixtureBody implements IterationBody {
     // post-reset stale write is suppressed rather than attributed to the current input.
     private Thread pendingStale;
     private CountDownLatch staleGate;
+    // Fine-grained evidence a clean-snapshot mode reports to the worker (defaults to normal success).
+    private int evidenceTag = Evidence.NORMAL_SUCCESS;
+    private String evidenceMessage = "";
+    private final Findings findings = new Findings();
 
     @Override
     public void run(byte[] payload) {
@@ -46,6 +58,9 @@ public final class FixtureBody implements IterationBody {
         snapshotDone = new CountDownLatch(1);
         lateRelease = new CountDownLatch(1);
         lateDone = new CountDownLatch(1);
+        evidenceTag = Evidence.NORMAL_SUCCESS;
+        evidenceMessage = "";
+        findings.reset();
         int mode = payload.length > 0 ? (payload[0] & 0xff) : -1;
         activeMode = mode;
         // The generation this input runs under; background work captures it so a write that lands
@@ -108,8 +123,47 @@ public final class FixtureBody implements IterationBody {
             case MODE_RUN_BUDGET_TIMEOUT ->
                 // Planted run-budget timeout: the worker must class this as TimeoutRun, not a crash.
                 throw new RunBudgetExceededException("planted run-budget timeout");
+            case MODE_OUT_OF_MEMORY ->
+                // Planted OOM: thrown (not actually allocated) so the worker classes it distinctly.
+                throw new OutOfMemoryError("planted out-of-memory");
+            case MODE_STACK_OVERFLOW -> throw new StackOverflowError("planted stack overflow");
+            case MODE_FOREGROUND_EXCEPTION ->
+                throw new RuntimeException("planted foreground exception");
+            case MODE_BACKGROUND_EXCEPTION -> {
+                // A background thread failed but the foreground run completed cleanly: an OkSnapshot
+                // carrying background-exception evidence.
+                evidenceTag = Evidence.BACKGROUND_EXCEPTION;
+                evidenceMessage = "planted background exception";
+            }
+            case MODE_LOGGED_FATAL -> {
+                // The server logged a fatal-level event without crashing.
+                evidenceTag = Evidence.LOGGED_FATAL;
+                evidenceMessage = "planted logged fatal";
+            }
+            case MODE_JSON_RPC_ERROR -> {
+                // A request returned a JSON-RPC error response: an OkSnapshot that is a finding.
+                evidenceTag = Evidence.JSON_RPC_ERROR;
+                evidenceMessage = "textDocument/hover";
+                findings.recordJsonRpcError("textDocument/hover", -32603, "planted internal error");
+                findings.publish();
+            }
+            case MODE_EXPECTED_CANCELLATION -> {
+                // A request was cancelled as expected: not a finding.
+                evidenceTag = Evidence.EXPECTED_CANCELLATION;
+                evidenceMessage = "textDocument/hover";
+            }
             default -> Target.run(payload);
         }
+    }
+
+    @Override
+    public int evidenceTag() {
+        return evidenceTag;
+    }
+
+    @Override
+    public String evidenceMessage() {
+        return evidenceMessage;
     }
 
     @Override
