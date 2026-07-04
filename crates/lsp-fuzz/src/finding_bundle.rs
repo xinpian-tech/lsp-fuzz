@@ -432,9 +432,9 @@ fn has_fatal_log(stderr: &str) -> bool {
 /// Upper bound on captured stderr, so a chatty shipped entrypoint cannot exhaust the driver's memory.
 const STDERR_CAPTURE_CAP: usize = 64 * 1024;
 
-/// Feed the entrypoint's stdin on a thread, staging the writes with barriers that mirror the warm
-/// in-process worker (`cov::LsIterationBody`: `initialized` once per epoch, then `requestAndWait` for
-/// each request, never `shutdown`/`exit` per input).
+/// Stage the cold-replay writes onto `writer`, mirroring the warm in-process worker
+/// (`cov::LsIterationBody`: `initialized` once per epoch, then `requestAndWait` for each request, never
+/// `shutdown`/`exit` per input).
 ///
 /// First it writes the handshake (`initialize` + `initialized`) and waits for bootstrap readiness
 /// (`ready_rx`, fed by the stderr reader); firing everything at once races the async bootstrap and
@@ -443,7 +443,47 @@ const STDERR_CAPTURE_CAP: usize = 64 * 1024;
 /// exact response id (from `resp_id_rx`, fed by the stdout reader) is awaited before the next frame —
 /// so a later/out-of-order response can never let teardown cut off an earlier request. Finally it
 /// writes `shutdown`/`exit`, only after every request step has replied or the deadline expired. Every
-/// wait is bounded by a single overall `deadline` so a broken/hung server can never hang us.
+/// wait is bounded by a single overall `deadline` so a broken/hung server can never hang us. Generic
+/// over the writer so the ordering is directly testable against an in-memory recording writer.
+fn drive_replay_writes<W: Write>(
+    writer: &mut W,
+    frames: &ColdReplayFrames,
+    deadline: Duration,
+    ready_rx: &Receiver<()>,
+    resp_id_rx: &Receiver<usize>,
+) {
+    let deadline_at = Instant::now() + deadline;
+    let remaining = || deadline_at.saturating_duration_since(Instant::now());
+    let _ = writer.write_all(&frames.handshake);
+    let _ = writer.flush();
+    let _ = ready_rx.recv_timeout(remaining());
+    // Track which response ids have arrived (a later one may precede the request currently awaited),
+    // so awaiting an id already seen returns immediately.
+    let mut seen = std::collections::HashSet::new();
+    for step in &frames.steps {
+        let _ = writer.write_all(step.bytes());
+        let _ = writer.flush();
+        if let ReplayStep::Request { id, .. } = step {
+            while !seen.contains(id) {
+                let wait = remaining();
+                if wait.is_zero() {
+                    break;
+                }
+                match resp_id_rx.recv_timeout(wait) {
+                    Ok(rid) => {
+                        seen.insert(rid);
+                    }
+                    Err(_) => break, // deadline or reader gone: stop awaiting, tear down
+                }
+            }
+        }
+    }
+    let _ = writer.write_all(&frames.teardown);
+    let _ = writer.flush();
+}
+
+/// Feed the entrypoint's stdin on a thread via [`drive_replay_writes`], then drop stdin to signal
+/// end-of-input.
 fn spawn_request_writer(
     mut stdin: ChildStdin,
     frames: ColdReplayFrames,
@@ -452,34 +492,7 @@ fn spawn_request_writer(
     resp_id_rx: Receiver<usize>,
 ) -> JoinHandle<()> {
     std::thread::spawn(move || {
-        let deadline_at = Instant::now() + deadline;
-        let remaining = || deadline_at.saturating_duration_since(Instant::now());
-        let _ = stdin.write_all(&frames.handshake);
-        let _ = stdin.flush();
-        let _ = ready_rx.recv_timeout(remaining());
-        // Track which response ids have arrived (a later one may precede the request currently
-        // awaited), so awaiting an id already seen returns immediately.
-        let mut seen = std::collections::HashSet::new();
-        for step in &frames.steps {
-            let _ = stdin.write_all(step.bytes());
-            let _ = stdin.flush();
-            if let ReplayStep::Request { id, .. } = step {
-                while !seen.contains(id) {
-                    let wait = remaining();
-                    if wait.is_zero() {
-                        break;
-                    }
-                    match resp_id_rx.recv_timeout(wait) {
-                        Ok(rid) => {
-                            seen.insert(rid);
-                        }
-                        Err(_) => break, // deadline or reader gone: stop awaiting, tear down
-                    }
-                }
-            }
-        }
-        let _ = stdin.write_all(&frames.teardown);
-        let _ = stdin.flush();
+        drive_replay_writes(&mut stdin, &frames, deadline, &ready_rx, &resp_id_rx);
         drop(stdin); // signal end-of-input
     })
 }
@@ -1449,13 +1462,44 @@ mod tests {
         );
     }
 
-    /// Regression for the Round-51 batched-replay gap: with TWO stored requests, a fake server replies
-    /// to the LATER request (id 2) immediately and the EARLIER one (id 1) only after a delay. The
-    /// sequential driver must still capture BOTH findings — it awaits id 1's response before tearing
-    /// the server down, so the earlier request's response is never cut off. The old design (send both,
-    /// wait for the highest id, then teardown) would drop the id-1 finding.
+    /// A `Write` that records into a shared buffer the test can inspect while the driver runs.
+    #[derive(Clone)]
+    struct RecordingWriter(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+    impl std::io::Write for RecordingWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// The request ids and lifecycle methods present in `bytes`, in occurrence order — used to assert
+    /// exactly what the driver has written so far.
+    fn written_requests(bytes: &[u8]) -> Vec<(String, Option<usize>)> {
+        parse_lsp_payloads(bytes)
+            .into_iter()
+            .filter_map(|m| match m {
+                JsonRPCMessage::Request {
+                    method,
+                    id: MessageId::Number(n),
+                    ..
+                } => Some((method.to_string(), Some(n))),
+                JsonRPCMessage::Notification { method, .. } => Some((method.to_string(), None)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Deterministic regression for the Round-51 batched-replay gap, observing the WRITE STREAM (stdin)
+    /// directly: [`drive_replay_writes`] runs on a background thread against a recording writer while
+    /// the test hand-drives the readiness/response channels, and asserts the exact frames written at
+    /// each step. It proves the driver sends one request at a time and awaits that request's response
+    /// before the next frame — so it FAILS if requests are batched after readiness or if teardown is
+    /// sent after only the highest response id is observed.
     #[test]
-    fn cold_replay_waits_for_each_request_even_when_a_later_one_replies_first() {
+    fn drive_replay_writes_sends_one_request_at_a_time_and_gates_teardown() {
         let mut input = LspInput::default();
         // Two pc-allowed requests → ids 1 (hover) and 2 (definition) in input order.
         input.messages.push(request(
@@ -1467,40 +1511,98 @@ mod tests {
             position_params("lsp-fuzz://a.scala"),
         ));
         let profile = ScalaExecutionProfile::presentation_compiler();
-        // Fake stdio server: signal readiness, drain stdin so the writer never blocks, answer
-        // initialize (id 0), then reply to id 2 FIRST and id 1 only after a delay, both JSON-RPC errors.
-        let script = concat!(
-            "printf 'bootstrap finished: ready\\n' >&2; ",
-            "cat >/dev/null & ",
-            "emit() { n=$(printf %s \"$1\" | wc -c); printf 'Content-Length: %s\\r\\n\\r\\n%s' \"$n\" \"$1\"; }; ",
-            "emit '{\"jsonrpc\":\"2.0\",\"id\":0,\"result\":{}}'; ",
-            "emit '{\"jsonrpc\":\"2.0\",\"id\":2,\"error\":{\"code\":-32000,\"message\":\"later replied first\"}}'; ",
-            "sleep 0.5; ",
-            "emit '{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":-32000,\"message\":\"earlier replied second\"}}'; ",
-            "wait",
-        );
-        let temp = tempfile::tempdir().unwrap();
-        let config = ColdReplayConfig {
-            profile: &profile,
-            program: "sh".to_string(),
-            args: vec!["-c".to_string(), script.to_string()],
-            temp_root: temp.path().to_path_buf(),
-            backdrop_root: None,
-            timeout: Duration::from_secs(10),
+        let dir = tempfile::tempdir().unwrap();
+        let frames = build_cold_replay_frames(&input, &profile, "file:///root", dir.path());
+
+        let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut writer = RecordingWriter(buf.clone());
+        let (ready_tx, ready_rx) = channel::<()>();
+        let (resp_tx, resp_rx) = channel::<usize>();
+        let driver = std::thread::spawn(move || {
+            drive_replay_writes(
+                &mut writer,
+                &frames,
+                Duration::from_secs(10),
+                &ready_rx,
+                &resp_rx,
+            );
+        });
+
+        // Poll the shared buffer until `pred` holds, or panic after a bounded wait.
+        let wait_until = |pred: &dyn Fn(&[(String, Option<usize>)]) -> bool, what: &str| {
+            for _ in 0..400 {
+                if pred(&written_requests(&buf.lock().unwrap())) {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            panic!(
+                "timed out waiting for: {what}\ngot: {:?}",
+                written_requests(&buf.lock().unwrap())
+            );
         };
-        let observation = cold_replay(&input, &config).unwrap();
-        let methods: std::collections::HashSet<_> =
-            observation.findings.iter().map(|f| f.signature()).collect();
-        assert!(
-            methods.iter().any(|s| s.contains("textDocument/hover")),
-            "the EARLIER request's finding (id 1, replied last) must not be cut off: {methods:?}"
+        let has = |v: &[(String, Option<usize>)], m: &str, id: Option<usize>| {
+            v.iter().any(|(mm, ii)| mm == m && *ii == id)
+        };
+
+        // (a) Before readiness the driver has only written the handshake (initialize + initialized).
+        wait_until(&|v| has(v, "initialized", None), "handshake written");
+        {
+            let v = written_requests(&buf.lock().unwrap());
+            assert!(has(&v, "initialize", Some(0)) && has(&v, "initialized", None));
+            assert!(
+                !v.iter().any(|(m, _)| m.starts_with("textDocument/")),
+                "no request may be sent before readiness: {v:?}"
+            );
+        }
+
+        // (b) After readiness the driver writes ONLY request id 1 and then blocks awaiting its response
+        //     — request id 2 and shutdown/exit must be absent.
+        ready_tx.send(()).unwrap();
+        wait_until(
+            &|v| has(v, "textDocument/hover", Some(1)),
+            "request id 1 written",
         );
-        assert!(
-            methods
-                .iter()
-                .any(|s| s.contains("textDocument/definition")),
-            "the later request's finding (id 2) must be present too: {methods:?}"
+        {
+            let v = written_requests(&buf.lock().unwrap());
+            assert!(
+                !has(&v, "textDocument/definition", Some(2)),
+                "req 2 must wait for req 1's response: {v:?}"
+            );
+            assert!(
+                !has(&v, "shutdown", Some(3)),
+                "teardown must not precede req 1's response: {v:?}"
+            );
+        }
+
+        // (c) Deliver response id 2 EARLY (id 1 still outstanding). The driver is awaiting id 1, so it
+        //     must NOT advance: request id 2 and shutdown/exit stay absent.
+        resp_tx.send(2).unwrap();
+        std::thread::sleep(Duration::from_millis(80));
+        {
+            let v = written_requests(&buf.lock().unwrap());
+            assert!(
+                !has(&v, "textDocument/definition", Some(2)) && !has(&v, "shutdown", Some(3)),
+                "an early response for a LATER request must not release an earlier await: {v:?}"
+            );
+        }
+
+        // (d) Deliver response id 1. The driver writes request id 2; its id 2 is already seen, so
+        //     teardown proceeds — shutdown/exit are written.
+        resp_tx.send(1).unwrap();
+        wait_until(
+            &|v| has(v, "shutdown", Some(3)),
+            "teardown written after both requests",
         );
+        {
+            let v = written_requests(&buf.lock().unwrap());
+            assert!(
+                has(&v, "textDocument/definition", Some(2)),
+                "req 2 must be written after req 1 replied: {v:?}"
+            );
+            assert!(has(&v, "exit", None), "exit follows shutdown: {v:?}");
+        }
+        driver.join().unwrap();
     }
 
     #[test]
