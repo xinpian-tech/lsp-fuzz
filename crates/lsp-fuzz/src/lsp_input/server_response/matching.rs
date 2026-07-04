@@ -96,14 +96,20 @@ impl<'a> RequestResponseMatching<'a> {
 #[cfg(test)]
 mod tests {
     use super::RequestResponseMatching;
-    use crate::lsp::{LspMessage, json_rpc::JsonRPCMessage};
-
-    const BACKDROP: &str = "/verified-backdrop";
-    // A frozen backdrop source (has SemanticDB) and a per-input dirty overlay file, in the exact
-    // on-disk layout the BackdropOverlayMaterializer produces under the backdrop root.
-    const BACKDROP_LOC: &str = "file:///verified-backdrop/sources/rvdecoderdb/X.scala";
-    const OVERLAY_LOC: &str =
-        "file:///verified-backdrop/.lsp-fuzz-overlay/lsp-fuzz-workspace_9/main.scala";
+    use crate::{
+        execution::scala_profile::ScalaExecutionProfile,
+        file_system::{FileSystemDirectory, FileSystemEntry},
+        lsp::{LspMessage, json_rpc::JsonRPCMessage},
+        lsp_input::{
+            LspInput, WorkspaceEntry,
+            materializer::{BackdropOverlayMaterializer, WorkspaceMaterializer},
+            messages::LspMessageSequence,
+        },
+        text_document::TextDocument,
+        utf8::Utf8Input,
+    };
+    use lsp_fuzz_grammars::Language;
+    use std::path::Path;
 
     fn request(method: &str, params: serde_json::Value) -> LspMessage {
         LspMessage::try_from_json(method, params).unwrap()
@@ -114,16 +120,87 @@ mod tests {
                             "end": { "line": 0, "character": 3 } })
     }
 
-    /// End-to-end proof through the production response-matching + lifting path (the same
-    /// `match_messages` JVM fuzzing / cold replay uses): a `textDocument/references` `Location[]` and a
-    /// `textDocument/rename` `WorkspaceEdit` (keyed by URI in `changes`) that mix a frozen
-    /// backdrop-source URI and a per-input overlay URI are matched to their stored requests and lifted
-    /// with the backdrop root supplied. Both must surface only virtual URIs
-    /// (`lsp-fuzz://backdrop/sources/...` for the indexed file, `lsp-fuzz://...` for the dirty overlay)
-    /// with NO raw host `file://` remaining — the dirty-buffer→indexed-file mapping the Scala index
-    /// path requires.
+    /// A single-file index-mode input with a dirty overlay `main.scala`.
+    fn index_input() -> LspInput {
+        let mut doc = TextDocument::new(Language::Scala, "object M:\n  val n = 1\n".into());
+        doc.update_metadata();
+        LspInput {
+            messages: LspMessageSequence::default(),
+            workspace: FileSystemDirectory::from([(
+                Utf8Input::new("main.scala".to_owned()),
+                FileSystemEntry::File(WorkspaceEntry::SourceFile(doc)),
+            )]),
+        }
+    }
+
+    /// A valid frozen backdrop (the markers `validate_backdrop_root` requires + a `sources/` file).
+    fn write_frozen_backdrop(root: &Path) {
+        std::fs::write(root.join("backdrop-metadata.json"), b"{}").unwrap();
+        std::fs::create_dir_all(root.join("bsp")).unwrap();
+        std::fs::write(root.join("bsp").join("mill-bsp.json"), b"{}").unwrap();
+        std::fs::create_dir_all(root.join("semanticdb").join("rvdecoderdb").join("src")).unwrap();
+        std::fs::write(
+            root.join("semanticdb")
+                .join("rvdecoderdb")
+                .join("src")
+                .join("Instruction.scala.semanticdb"),
+            b"sdb",
+        )
+        .unwrap();
+        std::fs::create_dir_all(root.join("sources").join("rvdecoderdb").join("src")).unwrap();
+        std::fs::write(
+            root.join("sources")
+                .join("rvdecoderdb")
+                .join("src")
+                .join("Instruction.scala"),
+            b"object Instruction\n",
+        )
+        .unwrap();
+    }
+
+    /// Run a `references` `Location[]` and rename `WorkspaceEdit` (in BOTH `changes` and
+    /// `documentChanges` forms) through the PRODUCTION `match_messages` + lifting path — proving the
+    /// dirty-buffer→indexed-file URI mapping the Scala index path requires. Crucially, the file:// URIs
+    /// are DERIVED
+    /// from the actual `BackdropOverlayMaterializer` output (the real localized overlay dir + the
+    /// configured backdrop root), not hard-coded layout strings, so this exercises the same
+    /// materializer/converter roots JVM fuzzing / cold replay thread into `match_messages`. Every
+    /// matched response must serialize with only virtual URIs (`lsp-fuzz://backdrop/sources/...` for
+    /// the frozen indexed source, `lsp-fuzz://…` for the dirty overlay) and NO raw host `file://`.
     #[test]
-    fn references_and_rename_responses_lift_backdrop_and_overlay_uris() {
+    fn references_and_rename_lift_uris_from_the_real_index_materializer() {
+        let tmp = tempfile::tempdir().unwrap();
+        let backdrop_root = tmp.path();
+        write_frozen_backdrop(backdrop_root);
+
+        // Materialize the index-mode input exactly as the JVM converter does: `ScalaExecutionProfile`
+        // index mode selects the `BackdropOverlayMaterializer` (asserted below), and we take the ACTUAL
+        // localized overlay dir it produces rather than duplicating the layout with string constants.
+        assert_eq!(
+            ScalaExecutionProfile::index().mode(),
+            crate::execution::scala_profile::ScalaProfileMode::Index
+        );
+        let materializer = BackdropOverlayMaterializer::new(backdrop_root.to_path_buf());
+        let placed = materializer.materialize(&index_input()).unwrap();
+        assert!(
+            placed.localization_dir.join("main.scala").is_file(),
+            "the dirty overlay file must be materialized under the localized dir"
+        );
+
+        // URIs the real LS would return: the dirty overlay file (under the materialized localization
+        // dir) and a frozen indexed source (under the configured backdrop root's `sources/`).
+        let overlay_uri = format!(
+            "file://{}/main.scala",
+            placed.localization_dir.to_str().unwrap()
+        );
+        let backdrop_uri = format!(
+            "file://{}/sources/rvdecoderdb/src/Instruction.scala",
+            backdrop_root.to_str().unwrap()
+        );
+        // `match_messages` lifts frozen-source URIs scoped to this backdrop root (as cold replay
+        // threads `config.backdrop_root`).
+        let root = backdrop_root.to_str().unwrap();
+
         let refs = request(
             "textDocument/references",
             serde_json::json!({
@@ -140,43 +217,47 @@ mod tests {
                 "newName": "Renamed"
             }),
         );
-        // Requests are numbered by order (id 1, id 2), matching `match_messages`.
-        let refs_response = JsonRPCMessage::response(
-            Some(1usize),
-            Some(serde_json::json!([
-                { "uri": BACKDROP_LOC, "range": range() },
-                { "uri": OVERLAY_LOC, "range": range() }
-            ])),
-            None,
-        );
-        let rename_response = JsonRPCMessage::response(
-            Some(2usize),
-            Some(serde_json::json!({
-                "changes": {
-                    BACKDROP_LOC: [ { "range": range(), "newText": "Renamed" } ],
-                    OVERLAY_LOC: [ { "range": range(), "newText": "Renamed" } ]
-                }
-            })),
-            None,
-        );
 
-        let sent = [refs.clone(), rename.clone()];
-        let received = [refs_response, rename_response];
-        let matching =
-            RequestResponseMatching::match_messages(sent.iter(), received.iter(), Some(BACKDROP))
-                .expect("responses match their stored requests");
+        // Three response shapes, each matched on its own so `match_messages` numbers the request id 1.
+        let references_result = serde_json::json!([
+            { "uri": backdrop_uri, "range": range() },
+            { "uri": overlay_uri, "range": range() }
+        ]);
+        let rename_changes = serde_json::json!({
+            "changes": {
+                backdrop_uri.clone(): [ { "range": range(), "newText": "Renamed" } ],
+                overlay_uri.clone(): [ { "range": range(), "newText": "Renamed" } ]
+            }
+        });
+        let rename_document_changes = serde_json::json!({
+            "documentChanges": [
+                { "textDocument": { "uri": backdrop_uri, "version": null },
+                  "edits": [ { "range": range(), "newText": "Renamed" } ] },
+                { "textDocument": { "uri": overlay_uri, "version": null },
+                  "edits": [ { "range": range(), "newText": "Renamed" } ] }
+            ]
+        });
 
-        for (label, req) in [("references", &refs), ("rename", &rename)] {
+        for (label, req, result) in [
+            ("references", &refs, references_result),
+            ("rename changes", &rename, rename_changes),
+            ("rename documentChanges", &rename, rename_document_changes),
+        ] {
+            let received = [JsonRPCMessage::response(Some(1usize), Some(result), None)];
+            let sent = [req.clone()];
+            let matching =
+                RequestResponseMatching::match_messages(sent.iter(), received.iter(), Some(root))
+                    .unwrap_or_else(|e| panic!("{label}: match_messages failed: {e:?}"));
             let response = matching
                 .find_response_of(req)
-                .unwrap_or_else(|| panic!("{label} response should be matched"));
+                .unwrap_or_else(|| panic!("{label}: response should be matched"));
             let json = serde_json::to_string(response).unwrap();
             assert!(
-                json.contains("lsp-fuzz://backdrop/sources/rvdecoderdb/X.scala"),
-                "{label}: the frozen backdrop source URI must lift to the virtual backdrop form: {json}"
+                json.contains("lsp-fuzz://backdrop/sources/rvdecoderdb/src/Instruction.scala"),
+                "{label}: the frozen indexed source URI must lift to the virtual backdrop form: {json}"
             );
             assert!(
-                json.contains("lsp-fuzz://main.scala"),
+                json.contains("lsp-fuzz://") && json.contains("main.scala"),
                 "{label}: the dirty overlay URI must lift to the virtual workspace form: {json}"
             );
             assert!(
