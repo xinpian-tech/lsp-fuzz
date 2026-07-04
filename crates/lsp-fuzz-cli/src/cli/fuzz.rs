@@ -105,14 +105,15 @@ pub(super) struct FuzzCommand {
     #[clap(long)]
     no_asan: bool,
 
-    #[clap(long, value_parser = parse_hash_map::<Language, PathBuf>)]
+    #[clap(long, value_parser = parse_hash_map::<Language, PathBuf>, default_value = "")]
     language_fragments: HashMap<Language, PathBuf>,
 
     /// Fuzz a JVM language-server target through the persistent coverage worker instead of the
-    /// native AFL fork server. The value is the full worker command (whitespace-separated), e.g.
-    /// `"java -cp out cov.Worker"`. In this mode the native ELF/AFL binary checks are skipped.
-    #[clap(long)]
-    jvm_worker: Option<String>,
+    /// native AFL fork server. Give the full worker argv (the program then its arguments), e.g.
+    /// `--jvm-worker java -cp out cov.Worker`. When present, the native ELF/AFL binary checks and
+    /// `--lsp-executable` are skipped; each token is preserved as a separate argv entry.
+    #[clap(long, num_args = 1.., allow_hyphen_values = true)]
+    jvm_worker: Vec<String>,
 }
 
 impl FuzzCommand {
@@ -124,15 +125,20 @@ impl FuzzCommand {
         self.state.create().context("Crating state dir")?;
         // A JVM target is driven through a persistent coverage worker, not the AFL fork server, so
         // it must not go through the native ELF/AFL binary inspection below.
-        if self.jvm_worker.is_some() {
+        if !self.jvm_worker.is_empty() {
             return self.run_jvm_mode(global_options);
         }
+        // Native fork-server mode requires a target binary; the JVM branch above does not.
+        let lsp_executable = self
+            .execution
+            .lsp_executable
+            .clone()
+            .context("--lsp-executable is required for native fuzzing (or use --jvm-worker)")?;
         let mut shmem_provider =
             StdShMemProvider::new().context("Creating shared memory provider")?;
 
-        let binary_info = self.check_binary().context("Checking binary")?;
-        let map_size = fuzz_target::dump_map_size(&self.execution.lsp_executable)
-            .context("Dumping map size")?;
+        let binary_info = Self::check_binary(&lsp_executable).context("Checking binary")?;
+        let map_size = fuzz_target::dump_map_size(&lsp_executable).context("Dumping map size")?;
         info!("Detected coverage map size: {}", map_size);
 
         let mut coverage_shmem = shmem_provider
@@ -241,7 +247,8 @@ impl FuzzCommand {
                 .new_shmem(INPUT_SHM_SIZE)
                 .context("Creating shared memory for test case passing")?;
             let fuzz_input = FuzzInput::SharedMemory(test_case_shmem);
-            let target_info = common::create_target_info(&self.execution, &binary_info);
+            let target_info =
+                common::create_target_info(&self.execution, &binary_info, lsp_executable.clone());
             let workspace_observer = WorkspaceObserver::new(temp_dir);
             let exec_config = FuzzExecutionConfig {
                 debug_child: self.execution.debug_child,
@@ -306,14 +313,8 @@ impl FuzzCommand {
     /// binary inspection: coverage comes from the worker's mmap map surfaced through
     /// [`JvmLspExecutor`], and crashes are the fuzzing objective.
     fn run_jvm_mode(self, global_options: GlobalOptions) -> Result<(), anyhow::Error> {
-        let worker_cmd: Vec<String> = self
+        let (program, args) = self
             .jvm_worker
-            .as_deref()
-            .unwrap_or_default()
-            .split_whitespace()
-            .map(str::to_owned)
-            .collect();
-        let (program, args) = worker_cmd
             .split_first()
             .context("--jvm-worker must name a worker program")?;
         let program = program.clone();
@@ -421,9 +422,10 @@ impl FuzzCommand {
         }
     }
 
-    fn check_binary(&self) -> Result<fuzz_target::StaticTargetBinaryInfo, anyhow::Error> {
-        let binary_file =
-            File::open(&self.execution.lsp_executable).context("Opening fuzz target")?;
+    fn check_binary(
+        lsp_executable: &std::path::Path,
+    ) -> Result<fuzz_target::StaticTargetBinaryInfo, anyhow::Error> {
+        let binary_file = File::open(lsp_executable).context("Opening fuzz target")?;
         // SAFETY: we are assuming that the file is not touched externally.
         let binary_file = unsafe { Mmap::map(&binary_file) }.context("Mapping fuzz target")?;
         common::analyze_fuzz_target(&binary_file)
@@ -437,5 +439,62 @@ impl FuzzCommand {
             .open(self.state.stats_file())
             .context("Creating stats file")?;
         Ok(BufWriter::new(stats_file))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::Parser;
+
+    use super::FuzzCommand;
+
+    /// A JVM-worker invocation must parse WITHOUT `--lsp-executable`, and `--jvm-worker` must
+    /// preserve the worker argv verbatim (program + hyphenated flags), not whitespace-split it.
+    #[test]
+    fn jvm_mode_parses_without_lsp_executable_and_preserves_argv() {
+        let parsed = FuzzCommand::try_parse_from([
+            "fuzz",
+            "--state",
+            "/tmp/lsp-fuzz-parse-test",
+            "--time-budget",
+            "0",
+            "--jvm-worker",
+            "java",
+            "-cp",
+            "out dir",
+            "cov.Worker",
+        ])
+        .expect("JVM mode should parse without --lsp-executable");
+        assert!(
+            parsed.execution.lsp_executable.is_none(),
+            "native --lsp-executable must be optional in JVM mode"
+        );
+        assert_eq!(
+            parsed.jvm_worker,
+            vec![
+                "java".to_owned(),
+                "-cp".to_owned(),
+                "out dir".to_owned(), // a spaced arg that whitespace-splitting would break
+                "cov.Worker".to_owned(),
+            ],
+            "worker argv must be preserved token-for-token"
+        );
+    }
+
+    /// The native (non-JVM) invocation still parses with a target and leaves `--jvm-worker` empty.
+    #[test]
+    fn native_mode_parses_with_lsp_executable() {
+        let parsed = FuzzCommand::try_parse_from([
+            "fuzz",
+            "--state",
+            "/tmp/lsp-fuzz-parse-test",
+            "--time-budget",
+            "0",
+            "--lsp-executable",
+            "/path/to/server",
+        ])
+        .expect("native mode should parse with --lsp-executable");
+        assert!(parsed.jvm_worker.is_empty());
+        assert!(parsed.execution.lsp_executable.is_some());
     }
 }

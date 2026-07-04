@@ -36,9 +36,10 @@ impl FuzzerStateDir {
 
 #[derive(Debug, clap::Parser)]
 pub struct ExecutorOptions {
-    /// Path to the LSP executable.
+    /// Path to the LSP executable. Required for the native fork-server mode; omit it when driving a
+    /// JVM target with `--jvm-worker`.
     #[clap(long)]
-    pub lsp_executable: PathBuf,
+    pub lsp_executable: Option<PathBuf>,
 
     /// Arguments to pass to the child process.
     #[clap(long)]

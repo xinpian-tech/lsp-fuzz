@@ -1,4 +1,10 @@
-use std::{hash::Hash, iter, path::Path, sync::mpsc, time::Duration};
+use std::{
+    hash::Hash,
+    iter,
+    path::{Path, PathBuf},
+    sync::mpsc,
+    time::Duration,
+};
 
 use anyhow::Context;
 use core_affinity::CoreId;
@@ -90,9 +96,10 @@ where
 pub fn create_target_info(
     options: &ExecutorOptions,
     binary_info: &StaticTargetBinaryInfo,
+    lsp_executable: PathBuf,
 ) -> FuzzTargetInfo {
     FuzzTargetInfo {
-        path: options.lsp_executable.clone(),
+        path: lsp_executable,
         args: options.target_args.clone(),
         persistent_fuzzing: binary_info.is_persistent_mode,
         defer_fork_server: binary_info.is_defer_fork_server,
