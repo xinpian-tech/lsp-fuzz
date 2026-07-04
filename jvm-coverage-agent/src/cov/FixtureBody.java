@@ -23,6 +23,7 @@ public final class FixtureBody implements IterationBody {
     private static final int MODE_SNAPSHOT_RACE = 0xE3;
     private static final int MODE_POST_RESET_STALE = 0xE4;
     private static final int MODE_RELEASE_STALE = 0xE5;
+    private static final int MODE_RUN_BUDGET_TIMEOUT = 0xE6;
 
     private static final long BACKGROUND_DELAY_MS = 30;
     private static final long NEVER_COMPLETES_MS = 60_000;
@@ -104,6 +105,9 @@ public final class FixtureBody implements IterationBody {
                     staleGate = null;
                 }
             }
+            case MODE_RUN_BUDGET_TIMEOUT ->
+                // Planted run-budget timeout: the worker must class this as TimeoutRun, not a crash.
+                throw new RunBudgetExceededException("planted run-budget timeout");
             default -> Target.run(payload);
         }
     }

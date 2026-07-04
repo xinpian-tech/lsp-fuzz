@@ -38,6 +38,7 @@ import java.util.stream.Stream;
  */
 public final class Worker {
     private static final int STATUS_OK_SNAPSHOT = 0;
+    private static final int STATUS_TIMEOUT_RUN = 1;
     private static final int STATUS_TIMEOUT_QUIESCENCE = 2;
     private static final int STATUS_LATE_COVERAGE = 3;
     private static final int STATUS_SNAPSHOT_RACE = 4;
@@ -130,7 +131,11 @@ public final class Worker {
         Lifecycle.reset();
         Cov.reset(generation);
         try {
-            body.run(payload); // may hang (0xFF) -> no reply; may throw -> fatal
+            body.run(payload); // may hang (0xFF) -> no reply; may throw
+        } catch (RunBudgetExceededException t) {
+            // An ordinary run timeout: non-attributable + restart, but NOT a crash objective.
+            Cov.dump();
+            return STATUS_TIMEOUT_RUN;
         } catch (Throwable t) {
             Cov.dump();
             return STATUS_FATAL_JVM_ERROR;

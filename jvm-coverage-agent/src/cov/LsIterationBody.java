@@ -14,6 +14,7 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 
 /**
  * Real in-process language-server body: embeds {@code ls.core.ScalaLs} inside the worker JVM and
@@ -146,14 +147,24 @@ public final class LsIterationBody implements IterationBody {
         completedRequests.add(method);
     }
 
-    /** Wait for {@code future} but never past the per-input run budget. */
+    /**
+     * Wait for {@code future} but never past the per-input run budget. Budget exhaustion is an
+     * ordinary run timeout ({@link RunBudgetExceededException}), not a crash, so the worker classes
+     * it as {@code TimeoutRun}.
+     */
     private static void awaitWithinBudget(CompletableFuture<?> future, long deadlineNanos)
             throws Exception {
         long remainingMs = (deadlineNanos - System.nanoTime()) / 1_000_000L;
         if (remainingMs <= 0) {
-            throw new RuntimeException("per-input run budget exceeded before request completed");
+            throw new RunBudgetExceededException(
+                    "per-input run budget exhausted before request completed");
         }
-        future.get(remainingMs, TimeUnit.MILLISECONDS);
+        try {
+            future.get(remainingMs, TimeUnit.MILLISECONDS);
+        } catch (TimeoutException e) {
+            throw new RunBudgetExceededException(
+                    "request did not complete within the per-input run budget");
+        }
     }
 
     /** Parse a millisecond value, falling back when unset/blank/invalid. Package-visible for tests. */

@@ -67,6 +67,7 @@ public final class Harness {
         h.lifecycleSnapshotRaceGate();
         h.lifecycleLateWriteNoBleedGate();
         h.lifecyclePostResetStaleGate();
+        h.lifecycleRunBudgetTimeoutGate();
         h.coldReplayGate();
         System.exit(h.failures == 0 ? 0 : 1);
     }
@@ -391,6 +392,25 @@ public final class Harness {
             } else {
                 fail("post-reset stale-write gate failed: " + describe(stale) + " / "
                         + describe(release));
+            }
+        } finally {
+            w.close();
+        }
+    }
+
+    /**
+     * A run-budget timeout must be classified as {@code TimeoutRun} (status 1), not a fatal JVM
+     * crash (status 5): an ordinary profile run timeout is non-attributable + restart, not a crash
+     * objective. The planted fixture throws {@link RunBudgetExceededException}.
+     */
+    private void lifecycleRunBudgetTimeoutGate() throws Exception {
+        WorkerHandle w = new WorkerHandle(FAST_WINDOWS);
+        try {
+            Run r = w.run(new byte[] {(byte) 0xE6}, 5000);
+            if (r != null && r.status == 1) {
+                ok("run-budget timeout classified as TimeoutRun (status 1), not a crash");
+            } else {
+                fail("run-budget timeout misclassified: " + describe(r) + " (expected status 1)");
             }
         } finally {
             w.close();

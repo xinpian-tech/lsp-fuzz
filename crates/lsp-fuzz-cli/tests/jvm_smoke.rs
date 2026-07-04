@@ -42,6 +42,7 @@ fn jvm_mode_fuzz_smoke_reaches_loop_without_deadlock() {
         format!("{agent}/cov/IterationBody.java"),
         format!("{agent}/cov/FixtureBody.java"),
         format!("{agent}/cov/LsIterationBody.java"),
+        format!("{agent}/cov/RunBudgetExceededException.java"),
         format!("{agent}/cov/Worker.java"),
         format!("{agent}/fixture/Target.java"),
         format!("{agent}/fixture/LateWriteFixture.java"),

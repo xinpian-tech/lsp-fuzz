@@ -677,6 +677,29 @@ mod tests {
         assert!(fatal.restart_required);
     }
 
+    /// A run-budget timeout (the Java worker returns status tag 1 for `RunBudgetExceededException`)
+    /// must decode to `TimeoutRun` and be a timeout-class restart — never a crash objective.
+    #[test]
+    fn run_budget_timeout_tag_is_timeout_not_crash() {
+        assert_eq!(WorkerStatus::from_tag(1), Some(WorkerStatus::TimeoutRun));
+        let reply = RunResult {
+            status: WorkerStatus::TimeoutRun,
+            iteration_id: 7,
+            nonzero_edges: 0,
+            covered_classes: vec![],
+        };
+        let decoded = RunResult::decode(&reply.encode()).unwrap();
+        assert_eq!(decoded.status, WorkerStatus::TimeoutRun);
+        let outcome = decide(decoded.status);
+        assert_eq!(outcome.exit_kind, ExitKind::Timeout);
+        assert!(!outcome.coverage_attributable);
+        assert!(outcome.restart_required);
+        assert_ne!(
+            outcome.exit_kind,
+            decide(WorkerStatus::FatalJvmError).exit_kind
+        );
+    }
+
     #[test]
     fn run_clean_snapshot_is_attributable() {
         let reply = RunResult {
@@ -942,6 +965,7 @@ mod tests {
             format!("{agent}/cov/IterationBody.java"),
             format!("{agent}/cov/FixtureBody.java"),
             format!("{agent}/cov/LsIterationBody.java"),
+            format!("{agent}/cov/RunBudgetExceededException.java"),
             format!("{agent}/cov/Worker.java"),
             format!("{agent}/fixture/Target.java"),
             format!("{agent}/fixture/LateWriteFixture.java"),
@@ -1006,6 +1030,7 @@ mod tests {
             format!("{agent}/cov/IterationBody.java"),
             format!("{agent}/cov/FixtureBody.java"),
             format!("{agent}/cov/LsIterationBody.java"),
+            format!("{agent}/cov/RunBudgetExceededException.java"),
             format!("{agent}/cov/Worker.java"),
             format!("{agent}/fixture/Target.java"),
             format!("{agent}/fixture/LateWriteFixture.java"),
@@ -1178,6 +1203,7 @@ mod tests {
             format!("{agent}/cov/IterationBody.java"),
             format!("{agent}/cov/FixtureBody.java"),
             format!("{agent}/cov/LsIterationBody.java"),
+            format!("{agent}/cov/RunBudgetExceededException.java"),
             format!("{agent}/cov/Worker.java"),
             format!("{agent}/fixture/Target.java"),
             format!("{agent}/fixture/LateWriteFixture.java"),
