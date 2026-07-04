@@ -1,3 +1,4 @@
+mod cold_replay;
 mod export;
 mod fuzz;
 mod mine_code_fragments;
@@ -6,6 +7,7 @@ mod reproduce;
 use std::{cmp::max, collections::HashMap, str::FromStr};
 
 use anyhow::{Context, bail};
+use cold_replay::ColdReplayCommand;
 use export::ExportCommand;
 use fuzz::FuzzCommand;
 use mine_code_fragments::MineCodeFragments;
@@ -34,6 +36,7 @@ impl Cli {
             Command::Export(cmd) => cmd.run(self.global_options),
             Command::ReproduceOne(cmd) => cmd.run(self.global_options),
             Command::ReproduceAll(cmd) => cmd.run(self.global_options),
+            Command::ColdReplay(cmd) => cmd.run(self.global_options),
         }
     }
 }
@@ -70,6 +73,7 @@ enum Command {
     Export(ExportCommand),
     ReproduceAll(ReproduceAll),
     ReproduceOne(ReproduceOne),
+    ColdReplay(ColdReplayCommand),
 }
 
 fn setup_logger(global_opts: &GlobalOptions) -> anyhow::Result<()> {

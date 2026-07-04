@@ -240,6 +240,17 @@ impl FindingBundle {
         Ok(buf)
     }
 
+    /// Load a bundle from a CBOR file written by [`FindingBundle::write_to`] (for cold replay).
+    ///
+    /// # Errors
+    ///
+    /// Returns any I/O or deserialization error.
+    pub fn read_from(path: &Path) -> io::Result<Self> {
+        let bytes = std::fs::read(path)?;
+        ciborium::from_reader(&bytes[..])
+            .map_err(|e| io::Error::other(format!("deserializing finding bundle: {e}")))
+    }
+
     /// Write the bundle to `dir` as a CBOR file named by its outcome class + a hash of the WHOLE
     /// input (workspace *and* message sequence, so two findings that differ only in their messages
     /// get distinct files). Writing is collision-safe: an identical bundle already on disk is left as
@@ -1309,6 +1320,8 @@ mod tests {
         let bytes = std::fs::read(&path).unwrap();
         let decoded: FindingBundle = ciborium::from_reader(&bytes[..]).unwrap();
         assert_eq!(decoded, bundle);
+        // `read_from` is the inverse of `write_to` (used by the cold-replay CLI).
+        assert_eq!(FindingBundle::read_from(&path).unwrap(), bundle);
     }
 
     #[test]
