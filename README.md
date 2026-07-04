@@ -172,12 +172,14 @@ profile mode with `--scala-mode`:
 ```bash
 lsp-fuzz-cli fuzz \
   --state <state-dir> \
-  --scala-mode pc \                 # `pc` (presentation compiler) or `index` (BSP-backed index paths)
+  --scala-mode pc \
   --language-fragments Scala=<fragment-output> \
   --time-budget 24 \
   --jvm-worker java --enable-native-access=ALL-UNNAMED -javaagent:<agent.jar> -cp <ls.jar> cov.Worker
 ```
 
+- `--scala-mode` selects `pc` (presentation compiler) or `index` (BSP-backed index paths).
+- `--jvm-worker` must come last, as the parser consumes everything after it as the worker argv.
 - `pc` mode exercises presentation-compiler paths (completion/hover/signatureHelp/definition).
 - `index` mode exercises BSP-backed index paths (references/rename/workspace-symbol) over a frozen,
   pre-indexed backdrop and requires `LS_SQLITE_LIB` (the server's pinned native SQLite) and
@@ -202,13 +204,19 @@ reproduces the recorded outcome class:
 ```bash
 lsp-fuzz-cli cold-replay \
   --bundle <state-dir>/solutions/finding-bundles/<finding>.cbor \
-  --ls-jar <ls.jar> \               # or $LS_JAR
-  --java <pinned-jdk>/bin/java \    # or $LS_JAVA — MUST be the server's pinned JDK
-  --backdrop-root <backdrop> \      # or $BACKDROP_OUT (required for index-mode findings)
-  --output <confirmed>.cbor         # optional: write back the confirmed bundle
+  --ls-jar <ls.jar> \
+  --java <pinned-jdk>/bin/java \
+  --backdrop-root <backdrop> \
+  --output <confirmed>.cbor
 ```
 
-A finding that reproduces is marked **confirmed**; one that does not is labelled
+- `--ls-jar` (or `$LS_JAR`): the server jar / classpath.
+- `--java` (or `$LS_JAVA`): the server's exact pinned JDK (a foreign build segfaults its FFM SQLite binding).
+- `--backdrop-root` (or `$BACKDROP_OUT`): required for index-mode findings.
+- `--output`: optional; write back the confirmed bundle.
+
+The command revalidates the bundle's provenance before replaying, so an incomplete bundle is rejected
+up front. A finding that reproduces is marked **confirmed**; one that does not is labelled
 **in-process-harness-only** rather than presented as a confirmed server crash.
 
 ## License

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Régime-2 index-reach gate: prove the agent-instrumented LS reaches SemanticDB/index/BSP code AND
+# Scala index-mode reach gate: prove the agent-instrumented LS reaches SemanticDB/index/BSP code AND
 # that the index methods (workspace/symbol, textDocument/references, textDocument/rename) actually
 # succeed against the frozen zaozi backdrop.
 #
