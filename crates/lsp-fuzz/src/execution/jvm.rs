@@ -1281,33 +1281,73 @@ mod tests {
         };
         let mut worker = JvmWorker::new(transport, &map_file, Duration::from_secs(30));
 
-        // (planted mode byte, expected outcome class). The fixture maps each mode to a distinct
-        // Evidence tag / thrown error; the worker serializes it and the Rust driver classifies it.
-        let matrix: &[(u8, OutcomeClass)] = &[
-            (0x01, OutcomeClass::NormalSuccess),
-            (0xE7, OutcomeClass::OutOfMemoryOrStackOverflow),
-            (0xE8, OutcomeClass::OutOfMemoryOrStackOverflow),
-            (0xE9, OutcomeClass::ForegroundException),
-            (0xEA, OutcomeClass::BackgroundException),
-            (0xEB, OutcomeClass::LoggedFatal),
-            (0xEC, OutcomeClass::JsonRpcError),
-            (0xED, OutcomeClass::ExpectedCancellation),
+        // (planted mode byte, expected class, expected is_finding). The fixture maps each mode to a
+        // distinct Evidence tag / thrown error; the worker serializes it and the driver classifies it.
+        let matrix: &[(u8, OutcomeClass, bool)] = &[
+            (0x01, OutcomeClass::NormalSuccess, false),
+            (0xE6, OutcomeClass::TimeoutOrDeadlock, true),
+            (0xE7, OutcomeClass::OutOfMemoryOrStackOverflow, true),
+            (0xE8, OutcomeClass::OutOfMemoryOrStackOverflow, true),
+            (0xE9, OutcomeClass::ForegroundException, true),
+            (0xEA, OutcomeClass::BackgroundException, true),
+            (0xEB, OutcomeClass::LoggedFatal, true),
+            (0xEC, OutcomeClass::JsonRpcError, true),
+            (0xED, OutcomeClass::ExpectedCancellation, false),
+            (0xEF, OutcomeClass::JvmFatal, true),
         ];
-        for (mode, expected) in matrix {
+        for (mode, expected, is_finding) in matrix {
             let outcome = worker.run(&[*mode]);
             assert_eq!(
                 outcome.outcome_class, *expected,
                 "planted mode {mode:#x} should classify as {expected:?}, got {outcome:?}"
             );
+            assert_eq!(
+                outcome.outcome_class.is_finding(),
+                *is_finding,
+                "planted mode {mode:#x} finding-membership mismatch for {expected:?}"
+            );
         }
 
-        // The JSON-RPC-error mode wrote a finding to the side channel; it parses into one finding.
-        let contents = std::fs::read_to_string(&findings_file)
-            .expect("the JSON-RPC-error mode must publish a findings file");
-        let set = findings_from_jvm_side_channel(&contents);
+        // The JSON-RPC-error mode publishes exactly one finding to the side channel.
+        worker.run(&[0xEC]);
+        let set = findings_from_jvm_side_channel(
+            &std::fs::read_to_string(&findings_file)
+                .expect("the JSON-RPC-error mode must publish a findings file"),
+        );
         assert_eq!(set.len(), 1, "one JSON-RPC finding expected, got {set:?}");
         assert_eq!(set.as_slice()[0].class, OutcomeClass::JsonRpcError);
         assert_eq!(set.as_slice()[0].error_code, Some(-32603));
+
+        // Negative: an expected cancellation is not a finding — its clean run publishes an empty file.
+        worker.run(&[0xED]);
+        let cancel_set = findings_from_jvm_side_channel(
+            &std::fs::read_to_string(&findings_file).unwrap_or_default(),
+        );
+        assert!(
+            cancel_set.is_empty(),
+            "expected cancellation must not produce a finding, got {cancel_set:?}"
+        );
+    }
+
+    /// A planted protocol desync at the driver boundary: a worker reply that fails to decode is a
+    /// [`WorkerStatus::ProtocolError`] and classifies as [`OutcomeClass::ProtocolDesync`] — a
+    /// harness/transport fault, not a server finding.
+    #[test]
+    fn protocol_desync_is_classified_and_not_a_finding() {
+        use crate::execution::outcome::OutcomeClass;
+
+        // A malformed reply (unknown status tag) cannot decode → the driver treats it as a protocol
+        // error and restarts.
+        let mut worker = JvmWorker::new(
+            MockTransport::new(vec![Ok(vec![0xFF, 0x00])]),
+            "/nonexistent/map",
+            Duration::from_secs(1),
+        );
+        let outcome = worker.run(b"input");
+        assert_eq!(outcome.outcome_class, OutcomeClass::ProtocolDesync);
+        assert!(!outcome.outcome_class.is_finding());
+        assert!(outcome.restart_required);
+        assert!(!outcome.coverage_attributable);
     }
 
     /// End-to-end coverage-lifecycle check on the real Java worker (no coverage agent needed — the

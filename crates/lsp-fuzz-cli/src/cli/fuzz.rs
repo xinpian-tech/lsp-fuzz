@@ -343,6 +343,9 @@ impl FuzzCommand {
 
         let temp_dir = self.temp_dir.clone().unwrap_or_else(std::env::temp_dir);
         let map_path = temp_dir.join(format!("jvm-cov-{}.bin", std::process::id()));
+        // The worker publishes JSON-RPC error responses (findings) at $COV_FINDINGS_PATH; the
+        // executor's outcome observer reads them after each run.
+        let findings_path = temp_dir.join(format!("jvm-findings-{}.tsv", std::process::id()));
 
         // The profile's timeout policy governs the worker: the per-input run budget and quiescence
         // deadline are passed as env, and the Rust reply deadline is derived from them (not
@@ -356,11 +359,13 @@ impl FuzzCommand {
             let program = program.clone();
             let args = args.clone();
             let map_path = map_path.clone();
+            let findings_path = findings_path.clone();
             move || {
                 let mut command = std::process::Command::new(&program);
                 command
                     .args(&args)
                     .env("COV_MAP_PATH", &map_path)
+                    .env("COV_FINDINGS_PATH", &findings_path)
                     .env("COV_RUN_TIMEOUT_MS", run_timeout_ms.to_string())
                     .env(
                         "COV_QUIESCE_DEADLINE_MS",
@@ -403,8 +408,13 @@ impl FuzzCommand {
             .objective(objective)
             .build();
 
-        let mut executor =
-            jvm_executor::JvmLspExecutor::with_observer(worker, spawn_worker, cov_observer);
+        let outcome_observer = jvm_executor::JvmOutcomeObserver::new(Some(findings_path.clone()));
+        let mut executor = jvm_executor::JvmLspExecutor::with_observers(
+            worker,
+            spawn_worker,
+            cov_observer,
+            outcome_observer,
+        );
 
         let mut fuzz_stages = {
             // The profile's invalid-message policy controls whether generation emits invalid

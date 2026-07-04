@@ -32,6 +32,8 @@ public final class FixtureBody implements IterationBody {
     private static final int MODE_LOGGED_FATAL = 0xEB;
     private static final int MODE_JSON_RPC_ERROR = 0xEC;
     private static final int MODE_EXPECTED_CANCELLATION = 0xED;
+    // 0xEE and 0xFF are reserved by Target (crash / hang); use 0xEF for the planted hard JVM fatal.
+    private static final int MODE_JVM_FATAL = 0xEF;
 
     private static final long BACKGROUND_DELAY_MS = 30;
     private static final long NEVER_COMPLETES_MS = 60_000;
@@ -145,15 +147,25 @@ public final class FixtureBody implements IterationBody {
                 evidenceTag = Evidence.JSON_RPC_ERROR;
                 evidenceMessage = "textDocument/hover";
                 findings.recordJsonRpcError("textDocument/hover", -32603, "planted internal error");
-                findings.publish();
             }
             case MODE_EXPECTED_CANCELLATION -> {
                 // A request was cancelled as expected: not a finding.
                 evidenceTag = Evidence.EXPECTED_CANCELLATION;
                 evidenceMessage = "textDocument/hover";
             }
+            case MODE_JVM_FATAL -> {
+                // A hard JVM fatal the worker can still observe: flag the class, then throw so the
+                // worker classes it FatalJvmError with JVM-fatal evidence (a true SIGSEGV would give
+                // no reply and the driver would time out instead).
+                evidenceTag = Evidence.JVM_FATAL;
+                evidenceMessage = "planted jvm fatal";
+                throw new Error("planted jvm fatal");
+            }
             default -> Target.run(payload);
         }
+        // A clean (non-throwing) run publishes its findings — empty for every mode except the planted
+        // JSON-RPC error — so a later read reflects exactly this input (no stale finding lingers).
+        findings.publish();
     }
 
     @Override
