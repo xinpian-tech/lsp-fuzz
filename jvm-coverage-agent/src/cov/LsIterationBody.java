@@ -291,10 +291,13 @@ public final class LsIterationBody implements IterationBody {
 
             // lsp4j serves every input on one long-lived read-loop thread, so that thread must write
             // under whatever generation is currently active — it cannot carry a single captured
-            // generation without suppressing later inputs' coverage. Cross-input safety instead comes
-            // from tracking each request future so quiescence drains the server's work within the
-            // input, plus the snapshot/late-watch/pre-reset guards. Scoping detached index-mode
-            // background executors to their generation is follow-up work.
+            // generation without suppressing later inputs' coverage. Cross-input safety comes from
+            // tracking each request future so quiescence drains the server's work within the input,
+            // plus the snapshot/late-watch/pre-reset guards. Detached index/BSP/PC executor work IS
+            // generation-scoped: the agent rewrites `Executor.execute`/`ExecutorService.submit` call
+            // sites in instrumented server code to capture the generation at submission
+            // (`Cov.capturingRunnable`/`capturingCallable`), so a task that fires after a later reset
+            // has a stale captured generation and its write is suppressed, not attributed here.
             ExecutorService exec = Executors.newCachedThreadPool(r -> {
                 Thread t = new Thread(r, "lsp-fuzz-ls");
                 t.setDaemon(true);

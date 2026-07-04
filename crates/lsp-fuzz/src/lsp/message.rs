@@ -230,9 +230,19 @@ fn localize_json_value(value: &mut serde_json::Value, workspace_uri: &str) {
 pub(crate) fn lift_localized_json(value: &mut serde_json::Value, backdrop_root: Option<&str>) {
     use serde_json::Value::{Array, Object, String};
     match value {
-        Object(inner) => inner.values_mut().for_each(|value| {
-            lift_localized_json(value, backdrop_root);
-        }),
+        Object(inner) => {
+            // Lift matching URI KEYS as well as values: a `WorkspaceEdit.changes` map is keyed BY the
+            // document URI, so a values-only walk would leave raw host `file://` keys in the lifted
+            // response. Rebuild the map, lifting each value recursively and each key that matches the
+            // workspace/backdrop policy (non-URI keys are left unchanged by `lift_localized_str`).
+            let taken = std::mem::take(inner);
+            for (key, mut val) in taken {
+                lift_localized_json(&mut val, backdrop_root);
+                let key =
+                    crate::lsp_input::uri::lift_localized_str(&key, backdrop_root).unwrap_or(key);
+                inner.insert(key, val);
+            }
+        }
         Array(items) => items.iter_mut().for_each(|value| {
             lift_localized_json(value, backdrop_root);
         }),
@@ -351,6 +361,35 @@ mod tests {
         assert_eq!(
             value["locations"][2]["uri"],
             serde_json::json!("file:///elsewhere/sources/Unrelated.scala")
+        );
+    }
+
+    /// A rename `WorkspaceEdit.changes` map is keyed BY the document URI, so the lifter must lift the
+    /// object KEYS, not only values — otherwise a raw host `file://` path leaks into the lifted edit.
+    /// Non-URI keys (`range`, `newText`) and unrelated paths stay untouched.
+    #[test]
+    fn test_lift_localized_json_workspace_edit_changes_keys() {
+        let mut value = serde_json::json!({
+            "changes": {
+                "file:///verified-backdrop/sources/rvdecoderdb/X.scala": [
+                    { "range": {}, "newText": "Renamed" }
+                ],
+                "file:///verified-backdrop/.lsp-fuzz-overlay/lsp-fuzz-workspace_9/main.scala": [
+                    { "range": {}, "newText": "Renamed" }
+                ],
+                "file:///elsewhere/sources/Unrelated.scala": [{ "range": {}, "newText": "x" }]
+            }
+        });
+        super::lift_localized_json(&mut value, Some("/verified-backdrop"));
+        let changes = value["changes"].as_object().unwrap();
+        assert!(changes.contains_key("lsp-fuzz://backdrop/sources/rvdecoderdb/X.scala"));
+        assert!(changes.contains_key("lsp-fuzz://main.scala"));
+        // Unrelated path (not under the backdrop root) keeps its raw key.
+        assert!(changes.contains_key("file:///elsewhere/sources/Unrelated.scala"));
+        // The edit values (range/newText) are untouched.
+        assert_eq!(
+            changes["lsp-fuzz://backdrop/sources/rvdecoderdb/X.scala"][0]["newText"],
+            serde_json::json!("Renamed")
         );
     }
 }

@@ -92,3 +92,97 @@ impl<'a> RequestResponseMatching<'a> {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::RequestResponseMatching;
+    use crate::lsp::{LspMessage, json_rpc::JsonRPCMessage};
+
+    const BACKDROP: &str = "/verified-backdrop";
+    // A frozen backdrop source (has SemanticDB) and a per-input dirty overlay file, in the exact
+    // on-disk layout the BackdropOverlayMaterializer produces under the backdrop root.
+    const BACKDROP_LOC: &str = "file:///verified-backdrop/sources/rvdecoderdb/X.scala";
+    const OVERLAY_LOC: &str =
+        "file:///verified-backdrop/.lsp-fuzz-overlay/lsp-fuzz-workspace_9/main.scala";
+
+    fn request(method: &str, params: serde_json::Value) -> LspMessage {
+        LspMessage::try_from_json(method, params).unwrap()
+    }
+
+    fn range() -> serde_json::Value {
+        serde_json::json!({ "start": { "line": 0, "character": 0 },
+                            "end": { "line": 0, "character": 3 } })
+    }
+
+    /// End-to-end proof through the production response-matching + lifting path (the same
+    /// `match_messages` JVM fuzzing / cold replay uses): a `textDocument/references` `Location[]` and a
+    /// `textDocument/rename` `WorkspaceEdit` (keyed by URI in `changes`) that mix a frozen
+    /// backdrop-source URI and a per-input overlay URI are matched to their stored requests and lifted
+    /// with the backdrop root supplied. Both must surface only virtual URIs
+    /// (`lsp-fuzz://backdrop/sources/...` for the indexed file, `lsp-fuzz://...` for the dirty overlay)
+    /// with NO raw host `file://` remaining — the dirty-buffer→indexed-file mapping the Scala index
+    /// path requires.
+    #[test]
+    fn references_and_rename_responses_lift_backdrop_and_overlay_uris() {
+        let refs = request(
+            "textDocument/references",
+            serde_json::json!({
+                "textDocument": { "uri": "lsp-fuzz://main.scala" },
+                "position": { "line": 0, "character": 0 },
+                "context": { "includeDeclaration": true }
+            }),
+        );
+        let rename = request(
+            "textDocument/rename",
+            serde_json::json!({
+                "textDocument": { "uri": "lsp-fuzz://main.scala" },
+                "position": { "line": 0, "character": 0 },
+                "newName": "Renamed"
+            }),
+        );
+        // Requests are numbered by order (id 1, id 2), matching `match_messages`.
+        let refs_response = JsonRPCMessage::response(
+            Some(1usize),
+            Some(serde_json::json!([
+                { "uri": BACKDROP_LOC, "range": range() },
+                { "uri": OVERLAY_LOC, "range": range() }
+            ])),
+            None,
+        );
+        let rename_response = JsonRPCMessage::response(
+            Some(2usize),
+            Some(serde_json::json!({
+                "changes": {
+                    BACKDROP_LOC: [ { "range": range(), "newText": "Renamed" } ],
+                    OVERLAY_LOC: [ { "range": range(), "newText": "Renamed" } ]
+                }
+            })),
+            None,
+        );
+
+        let sent = [refs.clone(), rename.clone()];
+        let received = [refs_response, rename_response];
+        let matching =
+            RequestResponseMatching::match_messages(sent.iter(), received.iter(), Some(BACKDROP))
+                .expect("responses match their stored requests");
+
+        for (label, req) in [("references", &refs), ("rename", &rename)] {
+            let response = matching
+                .find_response_of(req)
+                .unwrap_or_else(|| panic!("{label} response should be matched"));
+            let json = serde_json::to_string(response).unwrap();
+            assert!(
+                json.contains("lsp-fuzz://backdrop/sources/rvdecoderdb/X.scala"),
+                "{label}: the frozen backdrop source URI must lift to the virtual backdrop form: {json}"
+            );
+            assert!(
+                json.contains("lsp-fuzz://main.scala"),
+                "{label}: the dirty overlay URI must lift to the virtual workspace form: {json}"
+            );
+            assert!(
+                !json.contains("file://"),
+                "{label}: no raw host file:// URI may remain in the lifted response: {json}"
+            );
+        }
+    }
+}
