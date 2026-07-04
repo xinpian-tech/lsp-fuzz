@@ -51,6 +51,7 @@ public final class Harness {
         Harness h = new Harness();
         h.saturationGate();
         h.classReachOracleGate();
+        h.mapCollisionReportGate();
         h.lateWriteGuardGate();
         h.runTimeoutParseGate();
         WorkerHandle w = new WorkerHandle(FAST_WINDOWS);
@@ -149,6 +150,38 @@ public final class Harness {
             fail("class-reach oracle dropped a colliding class: " + names);
         }
         Cov.reset();
+    }
+
+    /**
+     * Map-collision report (docs/jvm-coverage-agent.md §2): coverage-map collision pressure is measured
+     * by the non-zero fill ratio of a real run's 2^16 edge map — a fill far below saturation means two
+     * distinct edges rarely hash to the same slot, so the `ls-*`/index signal is not collision-bound
+     * and the optional finer-signal scalac supplement is unnecessary. Reports occupied slots / 65536.
+     */
+    private void mapCollisionReportGate() throws Exception {
+        WorkerHandle w = new WorkerHandle(FAST_WINDOWS);
+        try {
+            Run r = w.run("map-collision-report-probe".getBytes(), 5000);
+            if (r == null) {
+                fail("map-collision report gate: unexpected timeout");
+                return;
+            }
+            int filled = countNonZero(r.map);
+            double pct = 100.0 * filled / MAP_SIZE;
+            // Far below saturation (docs §5 flags near-full maps): edge-hash collisions are rare.
+            if (filled > 0 && pct < 50.0) {
+                ok(String.format(
+                        "map-collision report: %d/%d edge slots filled = %.3f%% fill "
+                                + "(well below saturation; edge-hash collisions rare, signal not "
+                                + "collision-bound)",
+                        filled, MAP_SIZE, pct));
+            } else {
+                fail("map-collision report: fill ratio " + pct
+                        + "% (empty or near saturation) — tighten instrumentation or raise MAP_SIZE");
+            }
+        } finally {
+            w.close();
+        }
     }
 
     private void coverageGates(WorkerHandle w) throws Exception {

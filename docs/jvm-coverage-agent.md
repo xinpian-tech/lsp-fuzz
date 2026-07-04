@@ -106,6 +106,30 @@ filter widened to `ls/` + `dotty/tools/` + `scala/meta/`):
   16-bit edge hash), so two classes whose edges collide are still reported by name (regression test
   in the fixture harness).
 
+### Map-collision report
+
+Collision pressure on the 2^16 (65536-slot) AFL edge map is measured by the non-zero fill ratio of a
+real run's map (§2): the more slots occupied, the higher the chance two distinct edges hash to the same
+slot. Two guarantees keep the `ls-*`/index signal from being collision-bound:
+
+- **Edge map — far from saturation.** The fixture harness gate `mapCollisionReportGate` reports the
+  fill ratio of a real run's map and fails if it approaches saturation. Measured live occupancy stays
+  well under the map size: the no-BSP real-LS control run occupies ~931 slots (~1.4% fill), the
+  BSP-backed presentation-compiler run ~2428 (~3.7%), and the live index run ~1112–2432 (~1.7–3.7%) of
+  65536. At a few-percent fill the birthday-model probability that a newly exercised edge collides with
+  an existing one is only a few percent, so distinct semantic paths almost always land on distinct
+  slots. If a future, broader instrumentation scope pushes the fill toward saturation, §2/§5 prescribe
+  tightening the excludes or raising `MAP_SIZE` to 2^18.
+- **Class-reach map — collision-free by construction.** Covered-class reach uses dense unique integer
+  ids (not the 16-bit edge hash), so two classes whose edge hashes collide are still both reported;
+  `classReachOracleGate` proves this with two deliberately edge-hash-colliding classes.
+
+This is the map-collision report the optional plan supplement called for. Because the edge map is
+nowhere near saturation and class reach is collision-free, the `ls-*` semantic/index signal is not
+collision-limited, and the optional scalac `scalacOptions`/compiler-plugin supplement for a *finer*
+signal is not required for the acceptance criteria (a compiler plugin is explicitly not the coverage
+mechanism — §1 and the plan's design notes).
+
 ### Finding: the presentation compiler is gated on BSP
 
 The LS logs `no BSP connection ... PC is disabled` and answers `textDocument/completion` with an
