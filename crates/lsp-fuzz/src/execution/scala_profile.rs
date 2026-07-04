@@ -32,6 +32,17 @@ pub enum ScalaProfileMode {
     Index,
 }
 
+impl ScalaProfileMode {
+    /// The stable string id for this mode (`pc` / `index`), used in provenance records.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            ScalaProfileMode::PresentationCompiler => "pc",
+            ScalaProfileMode::Index => "index",
+        }
+    }
+}
+
 /// A Scala fuzzing profile: the language-server-facing policy for one mode.
 #[derive(Debug, Clone)]
 pub struct ScalaExecutionProfile {

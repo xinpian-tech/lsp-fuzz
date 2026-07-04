@@ -378,8 +378,28 @@ impl FuzzCommand {
         let worker = jvm::JvmWorker::new(transport, &map_path, worker_reply_deadline);
 
         let cov_observer = jvm_executor::jvm_coverage_observer("jvm-edges");
+        let outcome_observer = jvm_executor::JvmOutcomeObserver::new(Some(findings_path.clone()));
         let map_feedback = MaxMapFeedback::new(&cov_observer);
-        let mut feedback = feedback_or!(map_feedback, TestCaseFileNameFeedback::<CORPUS>::new());
+        // Export a provenanced finding bundle for every finding run. Provenance is read from the
+        // environment; when required fields are absent the export fails closed (logs + skips), so a
+        // finding is never written without enough metadata for a one-command cold replay.
+        let finding_export = {
+            let provenance = lsp_fuzz::finding_bundle::Provenance::from_env(
+                self.scala_mode.as_str(),
+                run_timeout_ms,
+            );
+            let bundle_dir = self.state.solution_dir().join("finding-bundles");
+            lsp_fuzz::finding_bundle::JvmFindingExportFeedback::new(
+                &outcome_observer,
+                provenance,
+                bundle_dir,
+            )
+        };
+        let mut feedback = feedback_or!(
+            map_feedback,
+            finding_export,
+            TestCaseFileNameFeedback::<CORPUS>::new()
+        );
         let mut objective = feedback_or!(
             TestCaseFileNameFeedback::<SOLUTION>::new(),
             CrashFeedback::new()
@@ -408,7 +428,6 @@ impl FuzzCommand {
             .objective(objective)
             .build();
 
-        let outcome_observer = jvm_executor::JvmOutcomeObserver::new(Some(findings_path.clone()));
         let mut executor = jvm_executor::JvmLspExecutor::with_observers(
             worker,
             spawn_worker,

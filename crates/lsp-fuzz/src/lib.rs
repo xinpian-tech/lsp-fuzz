@@ -7,6 +7,7 @@ pub mod corpus;
 pub mod debug;
 pub mod execution;
 pub mod file_system;
+pub mod finding_bundle;
 pub mod findings;
 pub mod fuzz_target;
 pub mod lsp;
