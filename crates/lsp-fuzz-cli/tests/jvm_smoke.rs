@@ -49,8 +49,10 @@ fn jvm_mode_fuzz_smoke_reaches_loop_without_deadlock() {
         .status();
     match compiled {
         Ok(s) if s.success() => {}
-        _ => {
-            eprintln!("skipping: fixture worker did not compile");
+        // javac is available (checked above), so a failed compile is a hard failure, not a skip.
+        Ok(_) => panic!("fixture worker sources failed to compile"),
+        Err(_) => {
+            eprintln!("skipping: could not run javac");
             return;
         }
     }

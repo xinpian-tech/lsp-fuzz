@@ -243,11 +243,26 @@ impl ToTargetBytes<LspInput> for JvmLspInputConverter {
             .workspace_root
             .join(format!("{}{input_hash}", LspInput::WORKSPACE_DIR_PREFIX));
         // Materialize the workspace so the real language server can read the source files. Same
-        // hash -> same directory, so re-materializing an unchanged workspace is idempotent.
-        let _ = std::fs::create_dir_all(&workspace_dir);
-        let _ = input.setup_workspace(&workspace_dir);
+        // hash -> same directory, so re-materializing an unchanged workspace is idempotent. A
+        // materialization failure must not silently replay an input against a missing workspace
+        // (`ToTargetBytes` cannot return an error), so fail loudly with context.
+        std::fs::create_dir_all(&workspace_dir).unwrap_or_else(|e| {
+            panic!(
+                "failed to create JVM workspace dir {}: {e}",
+                workspace_dir.display()
+            )
+        });
+        input.setup_workspace(&workspace_dir).unwrap_or_else(|e| {
+            panic!(
+                "failed to materialize JVM workspace {}: {e}",
+                workspace_dir.display()
+            )
+        });
 
-        let root_uri = uri::workspace_uri(&workspace_dir)
+        // The epoch is initialized once against a STABLE root — the temp workspace root that
+        // contains every per-input `lsp-fuzz-workspace_<hash>` subdirectory — so every input's
+        // documents live under the initialized root even though `initialize` is sent only once.
+        let root_uri = uri::workspace_uri(&self.workspace_root)
             .map(|path| format!("file://{path}"))
             .unwrap_or_default();
         let stream = input.request_bytes(&workspace_dir);

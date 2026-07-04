@@ -957,7 +957,9 @@ mod tests {
             .status();
         match compiled {
             Ok(status) if status.success() => {}
-            _ => return, // javac unavailable or failed to compile: skip
+            // javac ran but the sources failed to compile: a real regression, not a skip.
+            Ok(_) => panic!("javac is present but the agent sources failed to compile"),
+            Err(_) => return, // javac unavailable: skip
         }
         let map_file = out.path().join("map.bin");
         let mut command = Command::new("java");
@@ -1021,7 +1023,9 @@ mod tests {
             .status();
         match compiled {
             Ok(status) if status.success() => {}
-            _ => return, // javac unavailable or failed to compile: skip
+            // javac ran but the sources failed to compile: a real regression, not a skip.
+            Ok(_) => panic!("javac is present but the agent sources failed to compile"),
+            Err(_) => return, // javac unavailable: skip
         }
 
         // Spawn one worker epoch with sharp lifecycle windows so the test is fast and deterministic.
@@ -1178,17 +1182,17 @@ mod tests {
             .status();
         match compiled {
             Ok(status) if status.success() => {}
-            _ => {
-                eprintln!(
-                    "skipping: agent sources did not compile with {}",
-                    javac.display()
-                );
+            // The pinned javac exists (checked above), so a failed compile is a hard failure.
+            Ok(_) => panic!("agent sources failed to compile with {}", javac.display()),
+            Err(_) => {
+                eprintln!("skipping: could not run javac at {}", javac.display());
                 return;
             }
         }
 
         let map_file = out.path().join("ls-map.bin");
         let classes_file = out.path().join("ls-classes.txt");
+        let requests_file = out.path().join("ls-requests.txt");
         let classpath = format!("{}:{}", out.path().display(), ls_jar.display());
         let mut command = Command::new(&java);
         command.arg("--enable-native-access=ALL-UNNAMED");
@@ -1206,6 +1210,7 @@ mod tests {
             .arg("cov.Worker")
             .env("COV_ITERATION_BODY", "ls")
             .env("COV_MAP_PATH", &map_file)
+            .env("COV_REQUESTS_PATH", &requests_file)
             .env("COV_SETTLE_MS", "5")
             .env("COV_LATE_WATCH_MS", "5")
             .env("COV_QUIESCE_DEADLINE_MS", "15000");
@@ -1230,6 +1235,15 @@ mod tests {
         assert!(
             first.coverage_attributable && !first.restart_required,
             "the first real-input run must be an attributable snapshot (requests tracked + drained): {first:?}"
+        );
+
+        // Prove the EXACT stored requests were forwarded and completed, not just that some ls.*
+        // class was covered by initialize/didOpen. Both stored request kinds must appear.
+        let completed = std::fs::read_to_string(&requests_file).unwrap_or_default();
+        assert!(
+            completed.lines().any(|m| m == "textDocument/hover")
+                && completed.lines().any(|m| m == "textDocument/completion"),
+            "both stored requests must have executed and completed; completed:\n{completed}"
         );
 
         if agent_attached {

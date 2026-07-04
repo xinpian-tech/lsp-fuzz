@@ -41,6 +41,9 @@ public final class LsIterationBody implements IterationBody {
     private boolean initializedSent;
     private Object endpoint; // org.eclipse.lsp4j.jsonrpc.RemoteEndpoint (implements Endpoint)
     private final List<String> openDocuments = new ArrayList<>();
+    // Request methods forwarded and completed during the current input, published to
+    // $COV_REQUESTS_PATH so a test can prove the exact stored requests actually executed.
+    private final List<String> completedRequests = new ArrayList<>();
 
     // Cached reflection handles.
     private Method endpointRequest; // Endpoint.request(String, Object) -> CompletableFuture
@@ -55,7 +58,12 @@ public final class LsIterationBody implements IterationBody {
     public void run(byte[] payload) {
         ensureStarted();
         Envelope env = Envelope.parse(payload);
+        completedRequests.clear();
         try {
+            // Initialize the epoch once against the stable root the envelope carries, so every
+            // input's documents are opened under the initialized workspace root.
+            ensureInitialized(env.rootUri);
+
             // Per-input document reset: close everything the previous input opened.
             for (String uri : openDocuments) {
                 notifyServer("textDocument/didClose",
@@ -66,11 +74,31 @@ public final class LsIterationBody implements IterationBody {
             for (byte[] frame : env.frames) {
                 dispatch(new String(frame, StandardCharsets.UTF_8));
             }
+            publishCompletedRequests();
         } catch (RuntimeException e) {
             throw e;
         } catch (Exception e) {
             throw new RuntimeException("replaying the input's LSP sequence failed", e);
         }
+    }
+
+    /**
+     * Send {@code initialize} + {@code initialized} exactly once per epoch, built from the stable
+     * root the converter put in the envelope (not the per-input stream frame). Bootstrap degrades
+     * gracefully without a BSP/index connection.
+     */
+    private void ensureInitialized(String rootUri) throws Exception {
+        if (initializedSent) {
+            return;
+        }
+        String initParams = "{\"processId\":null,\"rootUri\":" + quote(rootUri)
+                + ",\"workspaceFolders\":[{\"uri\":" + quote(rootUri) + ",\"name\":\"lsp-fuzz\"}]"
+                + ",\"capabilities\":{}}";
+        Object future = endpointRequest.invoke(endpoint, "initialize", json(initParams));
+        ((CompletableFuture<?>) future).get(REQUEST_TIMEOUT_MS, TimeUnit.MILLISECONDS);
+        initializeSent = true;
+        notifyServer("initialized", json("{}"));
+        initializedSent = true;
     }
 
     /** Forward one JSON-RPC frame, owning the server lifecycle and tracking request futures. */
@@ -84,20 +112,8 @@ public final class LsIterationBody implements IterationBody {
         boolean isRequest = has(obj, "id");
 
         switch (method) {
-            case "initialize" -> {
-                if (!initializeSent) {
-                    requestAndWait(method, params);
-                    initializeSent = true;
-                }
-            }
-            case "initialized" -> {
-                if (!initializedSent) {
-                    notifyServer(method, params);
-                    initializedSent = true;
-                }
-            }
-            case "shutdown", "exit" -> {
-                // Owned by epoch teardown, never per input — the worker reuses this server.
+            case "initialize", "initialized", "shutdown", "exit" -> {
+                // Lifecycle is owned per epoch (see ensureInitialized); never replay it per input.
             }
             case "textDocument/didOpen" -> {
                 notifyServer(method, params);
@@ -119,10 +135,25 @@ public final class LsIterationBody implements IterationBody {
     private void requestAndWait(String method, Object params) throws Exception {
         Object future = endpointRequest.invoke(endpoint, method, params);
         Lifecycle.track((CompletableFuture<?>) future).get(REQUEST_TIMEOUT_MS, TimeUnit.MILLISECONDS);
+        // Record only after the future resolves, so the side channel lists completed requests.
+        completedRequests.add(method);
     }
 
     private void notifyServer(String method, Object params) throws Exception {
         endpointNotify.invoke(endpoint, method, params);
+    }
+
+    /** Publish the request methods completed this input to {@code $COV_REQUESTS_PATH}, if set. */
+    private void publishCompletedRequests() {
+        String path = System.getenv("COV_REQUESTS_PATH");
+        if (path == null) {
+            return;
+        }
+        try {
+            java.nio.file.Files.write(java.nio.file.Path.of(path), completedRequests);
+        } catch (java.io.IOException e) {
+            throw new RuntimeException("failed to write " + path, e);
+        }
     }
 
     /** Bring up the embedded server once per epoch: wire streams, launchers, and reflection. */
