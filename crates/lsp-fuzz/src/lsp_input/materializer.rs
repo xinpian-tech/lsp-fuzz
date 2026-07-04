@@ -76,6 +76,17 @@ impl WorkspaceMaterializer for GenericTempRootMaterializer {
 /// Keeps a verified, immutable pre-indexed backdrop root and writes only the input's files as a
 /// per-input overlay under it. The frozen `sources/`/`semanticdb/`/`bsp/` content is never touched
 /// and the tree is never re-copied; the server initializes at the backdrop root.
+///
+/// Coverage/indexing note: the overlay is a per-input *dirty buffer* placed under the
+/// `.lsp-fuzz-overlay/` scratch dir, which is OUTSIDE the frozen, pre-indexed `sources/` tree — so
+/// an overlay file has no SemanticDB of its own. On a substrate that only carries the recovered index and has
+/// no live build server, the index is empty until a build target produces SemanticDB, so semantic
+/// requests (`textDocument/references`, `textDocument/rename`) over the overlay return
+/// `-32803 "… has no SemanticDB output"`. That path still fuzzes the server's index request
+/// dispatch, lifecycle, and error-oracle surface (a crash there is a genuine finding); the semantic
+/// *result* surface (real reference/rename locations) requires a build-server-backed indexed
+/// workspace and is validated by the live reindex gate script under `jvm-coverage-agent/`
+/// (references/rename over the frozen backdrop with a live build server attached).
 #[derive(Debug, New)]
 pub struct BackdropOverlayMaterializer {
     backdrop_root: PathBuf,
