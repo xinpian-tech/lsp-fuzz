@@ -1715,14 +1715,16 @@ mod tests {
             agent_jar.as_deref().filter(|j| j.exists()),
             &classes_file,
         );
-        // A generous quiescence deadline so the index/BSP bootstrap + request work settles within the
-        // input window (the residual detached-executor concern is a thread that wakes AFTER this).
+        // Generous settle + late-watch + quiescence windows so the multithreaded index/BSP bootstrap
+        // churn is attributed WITHIN an input and the snapshot is taken only after the map stabilizes
+        // (a background index thread writing during a too-short snapshot window is correctly flagged
+        // instability, but here we want the measured inputs to run against a settled index).
         command
             .env("COV_ITERATION_BODY", "ls")
             .env("COV_MAP_PATH", &map_file)
             .env("COV_FINDINGS_PATH", &findings_file)
-            .env("COV_SETTLE_MS", "50")
-            .env("COV_LATE_WATCH_MS", "50")
+            .env("COV_SETTLE_MS", "300")
+            .env("COV_LATE_WATCH_MS", "300")
             .env("COV_QUIESCE_DEADLINE_MS", "20000");
         let Ok(transport) = SubprocessTransport::spawn(command) else {
             eprintln!("skipping: could not spawn the in-process index LS worker");
@@ -1738,6 +1740,13 @@ mod tests {
             out.path().to_path_buf(),
             crate::execution::scala_profile::ScalaExecutionProfile::index(),
         );
+
+        // Warm up in this epoch: the FIRST input absorbs the async index/BSP bootstrap churn (which
+        // otherwise races the snapshot). Its outcome is ignored; the worker stays alive (an instability
+        // rejects only the coverage, not the process), so the measured inputs below run against a
+        // settled index within the same warm epoch.
+        let warmup = index_references_input("warmup.scala", "object W:\n  val w = 0\n");
+        let _ = worker.run_capturing(&converter.to_target_bytes(&warmup).to_vec(), &mut buf);
 
         // Input N: a references request over the backdrop overlay — drives the real index path and any
         // background index/BSP/PC work it spawns.

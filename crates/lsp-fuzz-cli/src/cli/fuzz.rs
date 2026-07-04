@@ -405,7 +405,7 @@ impl FuzzCommand {
         // Export a provenanced finding bundle for every finding run. Provenance is read from the
         // environment; when required fields are absent the export fails closed (logs + skips), so a
         // finding is never written without enough metadata for a one-command cold replay.
-        let finding_export = {
+        let make_finding_export = || {
             let provenance = lsp_fuzz::finding_bundle::Provenance::from_env(
                 self.scala_mode.as_str(),
                 run_timeout_ms,
@@ -419,12 +419,19 @@ impl FuzzCommand {
         };
         let mut feedback = feedback_or!(
             map_feedback,
-            finding_export,
+            make_finding_export(),
             TestCaseFileNameFeedback::<CORPUS>::new()
         );
+        // A crash-class JVM finding (FatalJvmError / OOM / stack overflow / foreground exception)
+        // makes the OBJECTIVE interesting, and LibAFL does not run the corpus `feedback` chain for a
+        // solution — so the bundle export must also run on the objective path, or those findings would
+        // be saved as solutions with no provenanced bundle. A second exporter here covers that; the
+        // export is idempotent (one bundle per finding, keyed by the input hash), so a finding that
+        // trips both paths is written once, not corrupted.
         let mut objective = feedback_or!(
             TestCaseFileNameFeedback::<SOLUTION>::new(),
-            CrashFeedback::new()
+            CrashFeedback::new(),
+            make_finding_export()
         );
 
         let (corpus, solutions) =

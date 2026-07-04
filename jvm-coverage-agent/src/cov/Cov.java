@@ -21,7 +21,12 @@ import java.util.concurrent.atomic.AtomicLong;
 public final class Cov {
     public static final int MAP_SIZE = 1 << 16;
     public static final byte[] MAP = new byte[MAP_SIZE];
-    private static int prev = 0;
+    // Previous-edge state is PER THREAD (AFL's `prev_location` is per execution thread): the real LS
+    // runs instrumented code on many async compiler/server threads, and a process-global `prev` would
+    // make each edge depend on whichever thread happened to run the last probe, so identical inputs
+    // could yield different edge indices under normal scheduling. A 1-element int[] holder avoids
+    // boxing on the hot path.
+    private static final ThreadLocal<int[]> PREV = ThreadLocal.withInitial(() -> new int[1]);
 
     // classId -> class name (registered at instrumentation time) and the set of class ids that
     // have executed at least one probe. Concurrent because background compiler threads hit them.
@@ -133,12 +138,13 @@ public final class Cov {
         if (staleGenerationWrite()) {
             return; // stale background write from a finished generation: never touch the live map
         }
-        int edge = (prev ^ id) & (MAP_SIZE - 1);
+        int[] prevHolder = PREV.get();
+        int edge = (prevHolder[0] ^ id) & (MAP_SIZE - 1);
         int value = MAP[edge] & 0xff;
         if (value != 0xff) {
             MAP[edge] = (byte) (value + 1);
         }
-        prev = id >>> 1;
+        prevHolder[0] = id >>> 1;
         TOTAL_WRITES.incrementAndGet();
         LAST_WRITE_NANOS.set(System.nanoTime());
         if (snapshotClosedGeneration == activeGeneration) {
@@ -170,7 +176,10 @@ public final class Cov {
      */
     public static void reset(long generation) {
         Arrays.fill(MAP, (byte) 0);
-        prev = 0;
+        // Reset the calling (driver) thread's previous-edge state for the fresh input. Per-thread
+        // `prev` on the LS's own worker threads carries deterministically across identical inputs, so
+        // it is not a nondeterminism source; only the shared global was.
+        PREV.get()[0] = 0;
         COVERED_CLASSES.clear();
         activeGeneration = generation;
         snapshotClosedGeneration = -1;
